@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: frederickmarvel/inflora-saruman
-          ref: ade5a51
+          ref: ade5a51d97598302c0f83e9f6dbdf73b487f9418
           path: .ci/inflora-saruman
       - uses: actions/setup-go@v5
         with:
