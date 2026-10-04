@@ -23,14 +23,36 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: inflora
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: inflora_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U inflora -d inflora_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: frederickmarvel/inflora-saruman
+          ref: ade5a51
+          path: .ci/inflora-saruman
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24.x"
           cache: true
       - run: go mod download
       - run: make test
+        env:
+          TEST_DATABASE_URL: postgres://inflora:dev@localhost:5432/inflora_test?sslmode=disable
+          SARUMAN_SCHEMA_PATH: ${{ github.workspace }}/.ci/inflora-saruman/migrations/00001_init.up.sql
 
   build:
     runs-on: ubuntu-latest
