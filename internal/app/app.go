@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -33,7 +35,47 @@ var (
 	// violate an invariant the consumer enforces. Callers surface it as an
 	// actionable error instead of a generic failure.
 	ErrInconsistent = errors.New("inconsistent state")
+	// errHandleCollision rebinds signup to a fresh handle suffix.
+	errHandleCollision = errors.New("handle collision")
 )
+
+// MaxHandleSlugLen keeps generated handles within the streamers.handle
+// VARCHAR(40): slug (33) + "-" + suffix (6 hex). Mirrors the saruman
+// migration 00009 backfill shape.
+const MaxHandleSlugLen = 33
+
+// HandleFromName builds the public handle for a new streamer: an
+// alphanumeric slug of the display name plus a short random suffix.
+func HandleFromName(displayName string) (string, error) {
+	var b strings.Builder
+	dash := true // suppress leading dashes
+	for _, r := range strings.ToLower(displayName) {
+		// Only ASCII letters/digits become the slug; anything else (spaces,
+		// symbols, non-ASCII names) counts as a word break, matching the
+		// 00009 backfill's [^a-zA-Z0-9]+ semantics.
+		alnum := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		switch {
+		case alnum:
+			b.WriteByte(byte(r))
+			dash = false
+		case !dash && b.Len() > 0:
+			b.WriteByte('-')
+			dash = true
+		}
+		if b.Len() >= MaxHandleSlugLen {
+			break
+		}
+	}
+	slug := strings.Trim(b.String(), "-")
+	if slug == "" {
+		slug = "streamer"
+	}
+	buf := make([]byte, 3) // 6 hex chars; first 5 used → total ≤ 40
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return slug + "-" + hex.EncodeToString(buf)[:5], nil
+}
 
 // App owns Tolkien's application workflows and their infrastructure dependencies.
 type App struct {
@@ -117,6 +159,7 @@ type Settings struct {
 // Streamer is the public streamer identity representation.
 type Streamer struct {
 	ID, Email, DisplayName string
+	Handle                 string
 	Active, Verified       bool
 	CreatedAt              time.Time
 }
@@ -160,36 +203,54 @@ func (a *App) Signup(ctx context.Context, email, password, name, ip, ua string) 
 	id := uuid.New()
 	sessionID := uuid.New()
 	payload := events.StreamerRegisteredEvent{StreamerID: id.String(), Email: email, DisplayName: name, RegisteredAt: now}
-	err = tx(ctx, a.DB, func(t *sql.Tx) error {
-		if _, e := t.ExecContext(ctx, `INSERT INTO streamers(id,email,display_name,password_hash,is_active,is_verified) VALUES($1,$2,$3,$4,TRUE,FALSE)`, id, email, name, hash); e != nil {
-			if strings.Contains(e.Error(), "duplicate") {
-				return ErrConflict
+	// Handle collisions are astronomically rare (6-hex suffix) but a unique
+	// violation must not leak as EMAIL_EXISTS; retry with a fresh suffix.
+	// Migration: 00009_streamer_handle_live_sessions (CONTRACT_DRIFT D-033).
+	var handle string
+	for attempt := 0; attempt < 3; attempt++ {
+		h, herr := HandleFromName(name)
+		if herr != nil {
+			return Streamer{}, "", time.Time{}, herr
+		}
+		handle = h
+		err = tx(ctx, a.DB, func(t *sql.Tx) error {
+			if _, e := t.ExecContext(ctx, `INSERT INTO streamers(id,email,display_name,handle,password_hash,is_active,is_verified) VALUES($1,$2,$3,$4,$5,TRUE,FALSE)`, id, email, name, handle, hash); e != nil {
+				if strings.Contains(e.Error(), "uq_streamers_handle") {
+					// Retry with a new suffix; anything else is a real error.
+					return errHandleCollision
+				}
+				if strings.Contains(e.Error(), "duplicate") {
+					return ErrConflict
+				}
+				return e
 			}
+			if _, e := t.ExecContext(ctx, `INSERT INTO sessions(id,streamer_id,token_hash,last4,purpose,expires_at) VALUES($1,$2,$3,$4,'SESSION',$5)`, sessionID, id, tokenHash, last4(token), exp); e != nil {
+				return e
+			}
+			if _, e := t.ExecContext(ctx, `INSERT INTO streamer_settings(streamer_id) VALUES($1)`, id); e != nil {
+				return e
+			}
+			if _, e := t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'STREAMER','SIGNUP','STREAMER',$1,$2,$3)`, id, ip, ua); e != nil {
+				return e
+			}
+			// Outbox event in the same TX: streamer.registered.v1
+			streamerUUID := id
+			streamerIDStr := id.String()
+			envelope, e := events.NewEnvelope(events.StreamerRegistered, "tolkien", &streamerIDStr, payload)
+			if e != nil {
+				return e
+			}
+			_, e = outbox.Enqueue(ctx, t, "tolkien", "streamer", streamerUUID, &streamerUUID, envelope)
 			return e
+		})
+		if err == nil {
+			return Streamer{ID: id.String(), Email: email, DisplayName: name, Handle: handle, Active: true, CreatedAt: now}, token, exp, nil
 		}
-		if _, e := t.ExecContext(ctx, `INSERT INTO sessions(id,streamer_id,token_hash,last4,purpose,expires_at) VALUES($1,$2,$3,$4,'SESSION',$5)`, sessionID, id, tokenHash, last4(token), exp); e != nil {
-			return e
+		if !errors.Is(err, errHandleCollision) || attempt == 2 {
+			return Streamer{}, "", time.Time{}, err
 		}
-		if _, e := t.ExecContext(ctx, `INSERT INTO streamer_settings(streamer_id) VALUES($1)`, id); e != nil {
-			return e
-		}
-		if _, e := t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'STREAMER','SIGNUP','STREAMER',$1,$2,$3)`, id, ip, ua); e != nil {
-			return e
-		}
-		// Outbox event in the same TX: streamer.registered.v1
-		streamerUUID := id
-		streamerIDStr := id.String()
-		envelope, e := events.NewEnvelope(events.StreamerRegistered, "tolkien", &streamerIDStr, payload)
-		if e != nil {
-			return e
-		}
-		_, e = outbox.Enqueue(ctx, t, "tolkien", "streamer", streamerUUID, &streamerUUID, envelope)
-		return e
-	})
-	if err != nil {
-		return Streamer{}, "", time.Time{}, err
 	}
-	return Streamer{ID: id.String(), Email: email, DisplayName: name, Active: true, CreatedAt: now}, token, exp, nil
+	return Streamer{}, "", time.Time{}, err
 }
 
 // Login verifies credentials and creates a new session.
@@ -486,4 +547,121 @@ type adminPrincipalKey struct{}
 // be mistaken for a streamer session by the session-scoped handlers.
 func WithAdminPrincipal(r *http.Request, p AdminPrincipal) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), adminPrincipalKey{}, p))
+}
+
+// PublicCreator is the redacted public view of a streamer, served to
+// anonymous viewers (CONTRACT_DRIFT D-033). Never carries balance or
+// session internals — the same strip rule as the mock accountRepository.
+type PublicCreator struct {
+	Handle      string `json:"handle"`
+	DisplayName string `json:"display_name"`
+	Verified    bool   `json:"verified"`
+	CoverSeed   string `json:"cover_seed"`
+}
+
+// PublicTipSessionPayload bootstraps the anonymous tip form: creator
+// identity, whether they are live right now, and the active on-stream
+// widgets (empty until theme/widget persistence lands in P3).
+type PublicTipSessionPayload struct {
+	Creator       PublicCreator `json:"creator"`
+	Live          bool          `json:"live"`
+	SessionID     *string       `json:"session_id"`
+	LayoutWidgets []any         `json:"layout_widgets"`
+}
+
+// PublicCreatorPagePayload is the anonymous /u/{handle} view: identity, live
+// status, and the creator's public campaigns (empty until campaigns land in P4).
+type PublicCreatorPagePayload struct {
+	Creator   PublicCreator `json:"creator"`
+	Live      bool          `json:"live"`
+	Campaigns []any         `json:"campaigns"`
+}
+
+// publicCreator resolves a handle (case-insensitive) to its redacted public
+// identity. Inactive streamers are invisible to public routes.
+func (a *App) publicCreator(ctx context.Context, handle string) (PublicCreator, error) {
+	var id, actual, name string
+	var verified bool
+	err := a.DB.QueryRowContext(ctx, `SELECT id,handle,display_name,is_verified FROM streamers WHERE lower(handle)=lower($1) AND is_active`, strings.TrimSpace(handle)).Scan(&id, &actual, &name, &verified)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PublicCreator{}, ErrNotFound
+	}
+	if err != nil {
+		return PublicCreator{}, err
+	}
+	return PublicCreator{Handle: actual, DisplayName: name, Verified: verified, CoverSeed: id}, nil
+}
+
+// openLiveSession returns the caller's currently open live session, if any.
+func (a *App) openLiveSession(ctx context.Context, streamerID string) (sql.NullString, error) {
+	var openID sql.NullString
+	err := a.DB.QueryRowContext(ctx, `SELECT id FROM live_sessions WHERE streamer_id=$1 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1`, streamerID).Scan(&openID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return sql.NullString{}, err
+	}
+	return openID, nil
+}
+
+// PublicTipSession serves the anonymous tip-form bootstrap. The polled read is
+// rate-limited at the edge but not journaled (it refetches every 2s); writes
+// on the donation path are audited by their owning service. CONTRACT_DRIFT D-033.
+func (a *App) PublicTipSession(ctx context.Context, handle string) (PublicTipSessionPayload, error) {
+	creator, err := a.publicCreator(ctx, handle)
+	if err != nil {
+		return PublicTipSessionPayload{}, err
+	}
+	openID, err := a.openLiveSession(ctx, creator.CoverSeed)
+	if err != nil {
+		return PublicTipSessionPayload{}, err
+	}
+	payload := PublicTipSessionPayload{Creator: creator, Live: openID.Valid, LayoutWidgets: []any{}}
+	if openID.Valid {
+		sid := openID.String
+		payload.SessionID = &sid
+	}
+	return payload, nil
+}
+
+// PublicCreatorPage serves the anonymous creator page.
+func (a *App) PublicCreatorPage(ctx context.Context, handle string) (PublicCreatorPagePayload, error) {
+	creator, err := a.publicCreator(ctx, handle)
+	if err != nil {
+		return PublicCreatorPagePayload{}, err
+	}
+	openID, err := a.openLiveSession(ctx, creator.CoverSeed)
+	if err != nil {
+		return PublicCreatorPagePayload{}, err
+	}
+	return PublicCreatorPagePayload{Creator: creator, Live: openID.Valid, Campaigns: []any{}}, nil
+}
+
+// SetLive opens or closes the streamer's live session (CONTRACT_DRIFT D-037).
+// Exactly one session may be open per streamer (partial unique index);
+// concurrent opens converge via ON CONFLICT DO NOTHING and both callers read
+// back the one open session, satisfying the replay-safe-open promise.
+func (a *App) SetLive(ctx context.Context, streamerID string, live bool) (bool, *string, error) {
+	id, err := uuid.Parse(streamerID)
+	if err != nil {
+		return false, nil, ErrInvalid
+	}
+	if live {
+		if _, err := a.DB.ExecContext(ctx, `INSERT INTO live_sessions(streamer_id) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM live_sessions WHERE streamer_id=$1 AND ended_at IS NULL) ON CONFLICT (streamer_id) WHERE ended_at IS NULL DO NOTHING`, id); err != nil {
+			return false, nil, err
+		}
+		openID, err := a.openLiveSession(ctx, streamerID)
+		if err != nil {
+			return false, nil, err
+		}
+		if openID.Valid {
+			sid := openID.String
+			return true, &sid, nil
+		}
+		// Should be unreachable: the INSERT above either created the row or a
+		// concurrent opener won the index — but be safe against surprise states.
+		return false, nil, ErrInconsistent
+	}
+	if _, err := a.DB.ExecContext(ctx, `UPDATE live_sessions SET ended_at=NOW() WHERE streamer_id=$1 AND ended_at IS NULL`, id); err != nil {
+		return false, nil, err
+	}
+	return false, nil, nil
 }

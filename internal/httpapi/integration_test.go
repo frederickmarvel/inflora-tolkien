@@ -157,7 +157,7 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 	}
 	streamerID := "90000000-0000-4000-8000-000000000002"
 	bankID := "90000000-0000-4000-8000-000000000003"
-	if _, err = db.Exec(`INSERT INTO streamers(id,email,display_name,password_hash,is_active,is_verified) VALUES($1,'batch@example.com','Batch Streamer',$2,TRUE,TRUE)`, streamerID, passwordHash); err != nil {
+	if _, err = db.Exec(`INSERT INTO streamers(id,email,display_name,handle,password_hash,is_active,is_verified) VALUES($1,'batch@example.com','Batch Streamer','batch-streamer',$2,TRUE,TRUE)`, streamerID, passwordHash); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = db.Exec(`INSERT INTO streamer_settings(streamer_id) VALUES($1)`, streamerID); err != nil {
@@ -303,9 +303,10 @@ func resetSchema(t *testing.T, db *sql.DB) {
 		_, file, _, _ := runtime.Caller(0)
 		dir = filepath.Join(filepath.Dir(file), "..", "..", "..", "inflora-saruman", "migrations")
 	}
-	// Phase 3: apply both the base init and the Phase 1 reliability migration
-	// so the outbox writer has somewhere to put events.
-	files := []string{"00001_init.up.sql", "00003_reliability.up.sql"}
+	// Phase 3: apply the base init, the Phase 1 reliability migration and the
+	// P2 handles/live-sessions migration (CONTRACT_DRIFT D-033/D-037): signup
+	// writes streamers.handle and /v1/me reads live_sessions.
+	files := []string{"00001_init.up.sql", "00003_reliability.up.sql", "00009_streamer_handle_live_sessions.up.sql"}
 	for _, name := range files {
 		path := filepath.Join(dir, name)
 		schema, err := os.ReadFile(path)

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"database/sql"
 	"errors"
 	"net"
 	"net/http"
@@ -17,17 +18,21 @@ import (
 
 // Server exposes Tolkien's HTTP routes.
 type Server struct {
-	App         *app.App
-	InternalKey string
-	mux         *http.ServeMux
-	loginLimit  *middleware.RateLimiter
-	signupLimit *middleware.RateLimiter
-	adminLimit  *middleware.RateLimiter
+	App            *app.App
+	InternalKey    string
+	mux            *http.ServeMux
+	loginLimit     *middleware.RateLimiter
+	signupLimit    *middleware.RateLimiter
+	adminLimit     *middleware.RateLimiter
+	publicLimit    *middleware.RateLimiter
+	tipSessionLimit *middleware.RateLimiter
 }
 
 // New constructs an HTTP server using the supplied application and internal key.
 func New(a *app.App, internalKey string) *Server {
-	s := &Server{App: a, InternalKey: internalKey, mux: http.NewServeMux(), loginLimit: middleware.NewRateLimiter(5, time.Minute), signupLimit: middleware.NewRateLimiter(5, time.Minute), adminLimit: middleware.NewRateLimiter(10, time.Minute)}
+	// The tip form polls tip-session every 2s (CONTRACT_DRIFT D-033), so it
+	// gets its own bigger budget than the creator page's 60/min per peer.
+	s := &Server{App: a, InternalKey: internalKey, mux: http.NewServeMux(), loginLimit: middleware.NewRateLimiter(5, time.Minute), signupLimit: middleware.NewRateLimiter(5, time.Minute), adminLimit: middleware.NewRateLimiter(10, time.Minute), publicLimit: middleware.NewRateLimiter(60, time.Minute), tipSessionLimit: middleware.NewRateLimiter(240, time.Minute)}
 	s.routes()
 	return s
 }
@@ -71,8 +76,15 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /v1/auth/signup", s.rateLimit(s.signupLimit, http.HandlerFunc(s.signup)))
 	s.mux.Handle("POST /v1/auth/login", s.rateLimit(s.loginLimit, http.HandlerFunc(s.login)))
 	s.mux.HandleFunc("POST /v1/auth/logout", s.logout)
+	// Public viewer surfaces (CONTRACT_DRIFT D-033): anonymous, per-peer rate
+	// limited. tip-session is polled by the tip form every 2s and is NOT
+	// journaled; the creator page IS (actor_type=PUBLIC).
+	s.mux.Handle("GET /v1/public/u/{handle}/tip-session", s.rateLimitByPeer(s.tipSessionLimit, http.HandlerFunc(s.tipSession)))
+	s.mux.Handle("GET /v1/public/u/{handle}", s.rateLimitByPeer(s.publicLimit, http.HandlerFunc(s.publicCreator)))
 	s.mux.Handle("GET /v1/me", s.session(http.HandlerFunc(s.me)))
 	s.mux.Handle("GET /v1/me/balance", s.session(http.HandlerFunc(s.balance)))
+	// Live session ownership (CONTRACT_DRIFT D-037).
+	s.mux.Handle("PUT /v1/me/live", s.session(http.HandlerFunc(s.setLive)))
 	s.mux.Handle("GET /v1/me/settings", s.session(http.HandlerFunc(s.settings)))
 	s.mux.Handle("PUT /v1/me/settings", s.session(http.HandlerFunc(s.updateSettings)))
 	s.mux.Handle("GET /v1/me/bank-accounts", s.session(http.HandlerFunc(s.banks)))
@@ -108,6 +120,30 @@ func (s *Server) rateLimit(l *middleware.RateLimiter, next http.Handler) http.Ha
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// rateLimitByPeer rate-limits on the direct peer address. Public routes sit
+// behind no trusted proxy on the dev stack, so X-Forwarded-For is client-
+// controlled and must not pick the bucket (CONTRACT_DRIFT D-033 rate limit
+// has to actually bind). Prod ingress hardening (trusted real-ip layer) is a
+// separate milestone.
+func (s *Server) rateLimitByPeer(l *middleware.RateLimiter, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !l.Allow(peerAddr(r)) {
+			w.Header().Set("Retry-After", "60")
+			app.Error(w, r, 429, "RATE_LIMITED", "rate limit exceeded")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func peerAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 func clientIP(r *http.Request) string {
 	if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); forwarded != "" {
@@ -167,7 +203,7 @@ func (s *Server) signup(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	app.JSON(w, map[string]any{"streamer": map[string]any{"id": st.ID, "email": st.Email, "display_name": st.DisplayName, "is_active": st.Active, "created_at": st.CreatedAt}, "session_token": t, "expires_at": e}, 201)
+	app.JSON(w, map[string]any{"streamer": map[string]any{"id": st.ID, "email": st.Email, "display_name": st.DisplayName, "handle": st.Handle, "is_active": st.Active, "created_at": st.CreatedAt}, "session_token": t, "expires_at": e}, 201)
 }
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	var q struct {
@@ -200,14 +236,100 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	p, _ := app.PrincipalFromRequest(r)
-	var email, name string
+	var email, name, handle string
 	var active bool
 	var created time.Time
-	if err := s.App.DB.QueryRowContext(r.Context(), `SELECT email,display_name,is_active,created_at FROM streamers WHERE id=$1`, p.StreamerID).Scan(&email, &name, &active, &created); err != nil {
+	if err := s.App.DB.QueryRowContext(r.Context(), `SELECT email,display_name,handle,is_active,created_at FROM streamers WHERE id=$1`, p.StreamerID).Scan(&email, &name, &handle, &active, &created); err != nil {
 		app.Error(w, r, 404, "STREAMER_NOT_FOUND", "streamer not found")
 		return
 	}
-	app.JSON(w, map[string]any{"id": p.StreamerID, "email": email, "display_name": name, "is_active": active, "created_at": created}, 200)
+	// The open live session, if any (additive with handle per CONTRACT_DRIFT D-037).
+	var openID sql.NullString
+	if err := s.App.DB.QueryRowContext(r.Context(), `SELECT id FROM live_sessions WHERE streamer_id=$1 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1`, p.StreamerID).Scan(&openID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		app.Error(w, r, 500, "INTERNAL", "could not load live status")
+		return
+	}
+	app.JSON(w, map[string]any{"id": p.StreamerID, "email": email, "display_name": name, "handle": handle, "is_active": active, "created_at": created, "is_live": openID.Valid, "live_session_id": nullableString(openID)}, 200)
+}
+
+// nullableString renders an open live-session id as a JSON string or null.
+func nullableString(v sql.NullString) *string {
+	if !v.Valid {
+		return nil
+	}
+	s := v.String
+	return &s
+}
+
+// tipSession serves the anonymous tip-form bootstrap. Deliberately not
+// journaled: the form polls it every 2s per viewer (CONTRACT_DRIFT D-033).
+func (s *Server) tipSession(w http.ResponseWriter, r *http.Request) {
+	handle := r.PathValue("handle")
+	if strings.TrimSpace(handle) == "" {
+		app.Error(w, r, 404, "STREAMER_NOT_FOUND", "streamer not found")
+		return
+	}
+	payload, err := s.App.PublicTipSession(r.Context(), handle)
+	if err != nil {
+		if errors.Is(err, app.ErrNotFound) {
+			app.Error(w, r, 404, "STREAMER_NOT_FOUND", "streamer not found")
+			return
+		}
+		app.Error(w, r, 500, "INTERNAL", "internal server error")
+		return
+	}
+	app.JSON(w, payload, 200)
+}
+
+// publicCreator serves the anonymous creator page and journals the read with
+// a PUBLIC actor (CONTRACT_DRIFT D-033).
+func (s *Server) publicCreator(w http.ResponseWriter, r *http.Request) {
+	handle := r.PathValue("handle")
+	if strings.TrimSpace(handle) == "" {
+		app.Error(w, r, 404, "STREAMER_NOT_FOUND", "streamer not found")
+		return
+	}
+	page, err := s.App.PublicCreatorPage(r.Context(), handle)
+	if err != nil {
+		if errors.Is(err, app.ErrNotFound) {
+			app.Error(w, r, 404, "STREAMER_NOT_FOUND", "streamer not found")
+			return
+		}
+		app.Error(w, r, 500, "INTERNAL", "internal server error")
+		return
+	}
+	// Best-effort journal; audit failures never fail the public read. The IP is
+	// the direct peer address (sanitized to keep the INET cast honest) and the
+	// user agent is truncated to the column width.
+	var auditIP any
+	if parsed := net.ParseIP(peerAddr(r)); parsed != nil {
+		auditIP = parsed
+	}
+	ua := r.UserAgent()
+	if len(ua) > 500 {
+		ua = ua[:500]
+	}
+	_, _ = s.App.DB.ExecContext(r.Context(), `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES(NULL,'PUBLIC','VIEW_PROFILE','STREAMER',$1,$2,$3)`, page.Creator.CoverSeed, auditIP, ua)
+	app.JSON(w, page, 200)
+}
+
+// setLive opens or closes the caller's live session (CONTRACT_DRIFT D-037).
+// Replay-safe: opening an already-open session returns the existing one.
+func (s *Server) setLive(w http.ResponseWriter, r *http.Request) {
+	p, _ := app.PrincipalFromRequest(r)
+	var q struct {
+		Live *bool `json:"live"`
+	}
+	if app.Decode(r, &q) != nil || q.Live == nil {
+		app.Error(w, r, 400, "VALIDATION_FAILED", "invalid json")
+		return
+	}
+	live, sid, err := s.App.SetLive(r.Context(), p.StreamerID, *q.Live)
+	if err != nil {
+		app.Error(w, r, 500, "INTERNAL", "could not update live status")
+		return
+	}
+	app.JSON(w, map[string]any{"live": live, "live_session_id": sid}, 200)
 }
 func (s *Server) balance(w http.ResponseWriter, r *http.Request) {
 	p, _ := app.PrincipalFromRequest(r)
