@@ -561,9 +561,11 @@ type PublicCreator struct {
 
 // PublicTipSessionPayload bootstraps the anonymous tip form: creator
 // identity, whether they are live right now, and the active on-stream
-// widgets (empty until theme/widget persistence lands in P3).
+// widgets (empty until theme/widget persistence lands in P3). StreamerID
+// routes the form's write path to the ingest intent endpoint.
 type PublicTipSessionPayload struct {
 	Creator       PublicCreator `json:"creator"`
+	StreamerID    string        `json:"streamer_id"`
 	Live          bool          `json:"live"`
 	SessionID     *string       `json:"session_id"`
 	LayoutWidgets []any         `json:"layout_widgets"`
@@ -614,7 +616,7 @@ func (a *App) PublicTipSession(ctx context.Context, handle string) (PublicTipSes
 	if err != nil {
 		return PublicTipSessionPayload{}, err
 	}
-	payload := PublicTipSessionPayload{Creator: creator, Live: openID.Valid, LayoutWidgets: []any{}}
+	payload := PublicTipSessionPayload{Creator: creator, StreamerID: creator.CoverSeed, Live: openID.Valid, LayoutWidgets: []any{}}
 	if openID.Valid {
 		sid := openID.String
 		payload.SessionID = &sid
