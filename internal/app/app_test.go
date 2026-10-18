@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -20,6 +21,21 @@ func TestTokenCacheExpiresAndClears(t *testing.T) {
 	c.Clear()
 	if _, ok := c.Get("token"); ok {
 		t.Fatal("cleared cache entry returned")
+	}
+}
+
+func TestUpdateSettingsRejectsInvalidDisplayPricingBeforeDatabaseAccess(t *testing.T) {
+	t.Parallel()
+
+	a := New(nil, nil)
+	for _, settings := range []Settings{
+		{DisplayRate: 0, DisplayMin: 5, DisplayMax: 60, MinDonation: 1000, MaxDonation: 10000},
+		{DisplayRate: 1000, DisplayMin: 0, DisplayMax: 60, MinDonation: 1000, MaxDonation: 10000},
+		{DisplayRate: 1000, DisplayMin: 60, DisplayMax: 5, MinDonation: 1000, MaxDonation: 10000},
+	} {
+		if err := a.UpdateSettings(t.Context(), settings); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("UpdateSettings(%+v) error = %v, want ErrInvalid", settings, err)
+		}
 	}
 }
 

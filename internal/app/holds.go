@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/frederickmarvel/inflora-shared/events"
+	"github.com/frederickmarvel/inflora-shared/outbox"
 	"github.com/google/uuid"
 )
 
@@ -65,13 +66,21 @@ func (a *App) CreateHold(ctx context.Context, h Hold, actor, ip, userAgent strin
 		if err != nil {
 			return err
 		}
-		_, err = t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'ADMIN','HOLD_CREATED','FUND_HOLD',$2,$3,$4)`, actor, h.ID, ip, userAgent)
+		if _, err = t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'ADMIN','HOLD_CREATED','FUND_HOLD',$2,$3,$4)`, actor, h.ID, ip, userAgent); err != nil {
+			return err
+		}
+		streamerUUID, err := uuid.Parse(h.StreamerID)
+		if err != nil {
+			return err
+		}
+		envelope, err := events.NewEnvelope(events.FundHoldCreated, "tolkien", &h.StreamerID, events.FundHoldCreatedEvent{HoldID: h.ID, TargetType: h.TargetType, StreamerID: h.StreamerID, DonationID: h.DonationID, PayoutID: h.PayoutID, AmountIDR: h.AmountIDR, Reason: h.Reason, ExpiresAt: h.ExpiresAt, CreatedBy: actor, CreatedAt: h.CreatedAt})
+		if err != nil {
+			return err
+		}
+		_, err = outbox.Enqueue(ctx, t, "tolkien", "fund_hold", uuid.MustParse(h.ID), &streamerUUID, envelope)
 		return err
 	})
 	if err != nil {
-		return Hold{}, err
-	}
-	if err = a.publish(ctx, events.FundHoldCreated, h.StreamerID, events.FundHoldCreatedEvent{HoldID: h.ID, TargetType: h.TargetType, StreamerID: h.StreamerID, DonationID: h.DonationID, PayoutID: h.PayoutID, AmountIDR: h.AmountIDR, Reason: h.Reason, ExpiresAt: h.ExpiresAt, CreatedBy: actor, CreatedAt: h.CreatedAt}); err != nil {
 		return Hold{}, err
 	}
 	return h, nil
@@ -139,7 +148,18 @@ func (a *App) ReleaseHold(ctx context.Context, id, actor, note, ip, userAgent st
 		if _, err = t.ExecContext(ctx, `UPDATE fund_holds SET status='RELEASED',released_at=$2,released_by=$3,resolution_note=$4 WHERE id=$1`, id, now, actor, note); err != nil {
 			return err
 		}
-		_, err = t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'ADMIN','HOLD_RELEASED','FUND_HOLD',$2,$3,$4)`, actor, id, ip, userAgent)
+		if _, err = t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'ADMIN','HOLD_RELEASED','FUND_HOLD',$2,$3,$4)`, actor, id, ip, userAgent); err != nil {
+			return err
+		}
+		streamerUUID, err := uuid.Parse(h.StreamerID)
+		if err != nil {
+			return err
+		}
+		envelope, err := events.NewEnvelope(events.FundHoldReleased, "tolkien", &h.StreamerID, events.FundHoldReleasedEvent{HoldID: h.ID, TargetType: h.TargetType, StreamerID: h.StreamerID, ReleasedBy: actor, ReleasedAt: *h.ReleasedAt, ResolutionNote: note})
+		if err != nil {
+			return err
+		}
+		_, err = outbox.Enqueue(ctx, t, "tolkien", "fund_hold", uuid.MustParse(h.ID), &streamerUUID, envelope)
 		return err
 	})
 	if err != nil {
@@ -156,9 +176,6 @@ func (a *App) ReleaseHold(ctx context.Context, id, actor, note, ip, userAgent st
 	}
 	if expires.Valid {
 		h.ExpiresAt = &expires.Time
-	}
-	if err = a.publish(ctx, events.FundHoldReleased, h.StreamerID, events.FundHoldReleasedEvent{HoldID: h.ID, TargetType: h.TargetType, StreamerID: h.StreamerID, ReleasedBy: actor, ReleasedAt: *h.ReleasedAt, ResolutionNote: note}); err != nil {
-		return Hold{}, err
 	}
 	return h, nil
 }

@@ -36,8 +36,7 @@ func TestLifecyclePostgres(t *testing.T) {
 	resetSchema(t, db)
 	defer resetEmptySchema(t, db)
 
-	publisher := events.NewMemoryPublisher()
-	application := app.New(db, publisher)
+	application := app.New(db, nil)
 	h := New(application, "integration-secret").Handler()
 
 	signup := requestJSON(t, h, http.MethodPost, "/v1/auth/signup", map[string]any{"email": "phase3@example.com", "password": "correct-horse", "display_name": "Phase Three"}, nil)
@@ -124,8 +123,12 @@ func TestLifecyclePostgres(t *testing.T) {
 		t.Fatalf("old overlay token: %d %s", invalid.Code, invalid.Body.String())
 	}
 
-	if got := len(publisher.Events()); got < 3 {
-		t.Fatalf("published %d events", got)
+	var outboxCount int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE event_type IN ('streamer.registered.v1','streamer.settings.updated.v1','overlay.token.rotated.v1') AND streamer_id=$1`, signupBody.Streamer.ID).Scan(&outboxCount); err != nil {
+		t.Fatalf("outbox query: %v", err)
+	}
+	if outboxCount != 4 {
+		t.Fatalf("outbox events = %d, want 4", outboxCount)
 	}
 	var auditCount int
 	if err = db.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE actor_id=$1 AND action='TOKEN_ROTATE'`, signupBody.Streamer.ID).Scan(&auditCount); err != nil || auditCount != 2 {
@@ -145,8 +148,7 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 	defer func() { _ = db.Close() }()
 	resetSchema(t, db)
 	defer resetEmptySchema(t, db)
-	publisher := events.NewMemoryPublisher()
-	application := app.New(db, publisher)
+	application := app.New(db, nil)
 	h := New(application, "integration-secret").Handler()
 
 	passwordHash, err := auth.HashPassword("correct-horse")
@@ -229,22 +231,42 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 		t.Fatalf("processing=%d err=%v", processing, err)
 	}
 
-	var found bool
-	for _, event := range publisher.Events() {
-		if event.EventType != events.PayoutBatched {
-			continue
-		}
-		var payload events.PayoutBatchedEvent
-		if err = json.Unmarshal(event.Payload, &payload); err != nil {
-			t.Fatal(err)
-		}
-		if payload.BatchTotalIDR != 60000 || payload.BatchPayoutCount != 5 || payload.FIFOPosition < 1 || payload.FIFOPosition > 5 || payload.BankAccountLast4 != "4321" {
-			t.Fatalf("batch event: %#v", payload)
-		}
-		found = true
+	var batchedCount, executedCount int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id=$1 AND event_type=$2`, batchBody.ID, events.PayoutBatched).Scan(&batchedCount); err != nil {
+		t.Fatal(err)
 	}
-	if !found {
-		t.Fatal("no payout.batched event published")
+	if err = db.QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id=$1 AND event_type=$2`, batchBody.ID, events.PayoutBatchExecuted).Scan(&executedCount); err != nil {
+		t.Fatal(err)
+	}
+	if batchedCount != 5 || executedCount != 5 {
+		t.Fatalf("outbox batch events: batched=%d executed=%d", batchedCount, executedCount)
+	}
+	var createdHolds, releasedHolds int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id=$1 AND event_type=$2`, holdBody.ID, events.FundHoldCreated).Scan(&createdHolds); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id=$1 AND event_type=$2`, holdBody.ID, events.FundHoldReleased).Scan(&releasedHolds); err != nil {
+		t.Fatal(err)
+	}
+	if createdHolds != 1 || releasedHolds != 1 {
+		t.Fatalf("outbox hold events: created=%d released=%d", createdHolds, releasedHolds)
+	}
+	var payload events.PayoutBatchedEvent
+	var envelopeJSON []byte
+	if err = db.QueryRow(`SELECT envelope FROM outbox_events WHERE aggregate_id=$1 AND event_type=$2 ORDER BY occurred_at,event_id LIMIT 1`, batchBody.ID, events.PayoutBatched).Scan(&envelopeJSON); err != nil {
+		t.Fatal(err)
+	}
+	var stored struct {
+		Envelope events.Envelope `json:"envelope"`
+	}
+	if err = json.Unmarshal(envelopeJSON, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(stored.Envelope.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.BatchTotalIDR != 60000 || payload.BatchPayoutCount != 5 || payload.FIFOPosition < 1 || payload.FIFOPosition > 5 || payload.BankAccountLast4 != "4321" {
+		t.Fatalf("batch event: %#v", payload)
 	}
 }
 
@@ -276,17 +298,23 @@ func decodeBody(t *testing.T, w *httptest.ResponseRecorder, v any) {
 func resetSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	resetEmptySchema(t, db)
-	path := os.Getenv("SARUMAN_SCHEMA_PATH")
-	if path == "" {
+	dir := os.Getenv("SARUMAN_SCHEMA_DIR")
+	if dir == "" {
 		_, file, _, _ := runtime.Caller(0)
-		path = filepath.Join(filepath.Dir(file), "..", "..", "..", "inflora-saruman", "migrations", "00001_init.up.sql")
+		dir = filepath.Join(filepath.Dir(file), "..", "..", "..", "inflora-saruman", "migrations")
 	}
-	schema, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read schema %s: %v", path, err)
-	}
-	if _, err = db.Exec(string(schema)); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	// Phase 3: apply both the base init and the Phase 1 reliability migration
+	// so the outbox writer has somewhere to put events.
+	files := []string{"00001_init.up.sql", "00003_reliability.up.sql"}
+	for _, name := range files {
+		path := filepath.Join(dir, name)
+		schema, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read schema %s: %v", path, err)
+		}
+		if _, err = db.Exec(string(schema)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
 	}
 }
 func resetEmptySchema(t *testing.T, db *sql.DB) {

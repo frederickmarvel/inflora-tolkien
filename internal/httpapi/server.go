@@ -22,11 +22,12 @@ type Server struct {
 	mux         *http.ServeMux
 	loginLimit  *middleware.RateLimiter
 	signupLimit *middleware.RateLimiter
+	adminLimit  *middleware.RateLimiter
 }
 
 // New constructs an HTTP server using the supplied application and internal key.
 func New(a *app.App, internalKey string) *Server {
-	s := &Server{App: a, InternalKey: internalKey, mux: http.NewServeMux(), loginLimit: middleware.NewRateLimiter(5, time.Minute), signupLimit: middleware.NewRateLimiter(5, time.Minute)}
+	s := &Server{App: a, InternalKey: internalKey, mux: http.NewServeMux(), loginLimit: middleware.NewRateLimiter(5, time.Minute), signupLimit: middleware.NewRateLimiter(5, time.Minute), adminLimit: middleware.NewRateLimiter(10, time.Minute)}
 	s.routes()
 	return s
 }
@@ -86,6 +87,17 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/admin/payout-batches", s.listBatches)
 	s.mux.HandleFunc("POST /v1/admin/payout-batches/{id}/execute", s.executeBatch)
 	s.mux.HandleFunc("POST /v1/admin/email-records/{donation_id}/resend", s.resendReceipt)
+
+	// Admin monitoring surface. These are gated by an `ak_` admin session
+	// token rather than the internal API key, so the donation console is
+	// independently attributable to a named human operator.
+	s.mux.Handle("POST /v1/admin/login", s.rateLimit(s.adminLimit, http.HandlerFunc(s.adminLogin)))
+	s.mux.HandleFunc("POST /v1/admin/logout", s.adminLogout)
+	s.mux.Handle("GET /v1/admin/me", s.adminSession(http.HandlerFunc(s.adminMe)))
+	s.mux.Handle("GET /v1/admin/donations", s.adminSession(http.HandlerFunc(s.adminDonations)))
+	s.mux.Handle("GET /v1/admin/donations/summary", s.adminSession(http.HandlerFunc(s.adminDonationSummary)))
+	s.mux.Handle("GET /v1/admin/donations/{id}", s.adminSession(http.HandlerFunc(s.adminDonationDetail)))
+	s.mux.Handle("POST /v1/admin/donations/{id}/override", s.adminSession(http.HandlerFunc(s.adminDonationOverride)))
 }
 func (s *Server) rateLimit(l *middleware.RateLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

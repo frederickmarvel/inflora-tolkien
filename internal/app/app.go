@@ -14,6 +14,7 @@ import (
 	"github.com/frederickmarvel/inflora-shared/auth"
 	"github.com/frederickmarvel/inflora-shared/events"
 	sharedmiddleware "github.com/frederickmarvel/inflora-shared/middleware"
+	"github.com/frederickmarvel/inflora-shared/outbox"
 	"github.com/google/uuid"
 )
 
@@ -28,16 +29,21 @@ var (
 	ErrExpired = errors.New("expired")
 	// ErrInvalid indicates invalid input or credentials.
 	ErrInvalid = errors.New("invalid")
+	// ErrInconsistent marks a write that cannot succeed because existing rows
+	// violate an invariant the consumer enforces. Callers surface it as an
+	// actionable error instead of a generic failure.
+	ErrInconsistent = errors.New("inconsistent state")
 )
 
 // App owns Tolkien's application workflows and their infrastructure dependencies.
 type App struct {
 	DB                     *sql.DB
-	Publisher              events.Publisher
 	SessionTTL, OverlayTTL time.Duration
+	AdminTTL               time.Duration
 	InternalAPIKey         string
 	OverlayURL             string
 	Tokens                 *TokenCache
+	PalantirAdmin          DonationOverrider
 	mu                     sync.Mutex
 }
 
@@ -60,8 +66,8 @@ type Principal struct {
 }
 
 // New constructs the Tolkien application service.
-func New(db *sql.DB, p events.Publisher) *App {
-	return &App{DB: db, Publisher: p, SessionTTL: 30 * 24 * time.Hour, OverlayTTL: 90 * 24 * time.Hour, OverlayURL: "https://overlay.inflora.app/?token=", Tokens: NewTokenCache(60 * time.Second)}
+func New(db *sql.DB, _ events.Publisher) *App {
+	return &App{DB: db, SessionTTL: 30 * 24 * time.Hour, OverlayTTL: 90 * 24 * time.Hour, AdminTTL: 12 * time.Hour, OverlayURL: "https://overlay.inflora.app/?token=", Tokens: NewTokenCache(60 * time.Second)}
 }
 
 // NewTokenCache constructs a token cache with the supplied TTL.
@@ -128,6 +134,8 @@ type BankAccount struct {
 }
 
 // Signup creates a streamer, default settings, audit entry, and session.
+// The streamer.registered.v1 event is written to the transactional outbox
+// in the same DB transaction as the streamer row (Phase 3 plan).
 func (a *App) Signup(ctx context.Context, email, password, name, ip, ua string) (Streamer, string, time.Time, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	name = strings.TrimSpace(name)
@@ -151,6 +159,7 @@ func (a *App) Signup(ctx context.Context, email, password, name, ip, ua string) 
 	exp := now.Add(a.SessionTTL)
 	id := uuid.New()
 	sessionID := uuid.New()
+	payload := events.StreamerRegisteredEvent{StreamerID: id.String(), Email: email, DisplayName: name, RegisteredAt: now}
 	err = tx(ctx, a.DB, func(t *sql.Tx) error {
 		if _, e := t.ExecContext(ctx, `INSERT INTO streamers(id,email,display_name,password_hash,is_active,is_verified) VALUES($1,$2,$3,$4,TRUE,FALSE)`, id, email, name, hash); e != nil {
 			if strings.Contains(e.Error(), "duplicate") {
@@ -164,17 +173,21 @@ func (a *App) Signup(ctx context.Context, email, password, name, ip, ua string) 
 		if _, e := t.ExecContext(ctx, `INSERT INTO streamer_settings(streamer_id) VALUES($1)`, id); e != nil {
 			return e
 		}
-		_, e := t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'STREAMER','SIGNUP','STREAMER',$1,$2,$3)`, id, ip, ua)
+		if _, e := t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'STREAMER','SIGNUP','STREAMER',$1,$2,$3)`, id, ip, ua); e != nil {
+			return e
+		}
+		// Outbox event in the same TX: streamer.registered.v1
+		streamerUUID := id
+		streamerIDStr := id.String()
+		envelope, e := events.NewEnvelope(events.StreamerRegistered, "tolkien", &streamerIDStr, payload)
+		if e != nil {
+			return e
+		}
+		_, e = outbox.Enqueue(ctx, t, "tolkien", "streamer", streamerUUID, &streamerUUID, envelope)
 		return e
 	})
 	if err != nil {
 		return Streamer{}, "", time.Time{}, err
-	}
-	if a.Publisher != nil {
-		payload := events.StreamerRegisteredEvent{StreamerID: id.String(), Email: email, DisplayName: name, RegisteredAt: now}
-		if e := a.publish(ctx, events.StreamerRegistered, id.String(), payload); e != nil {
-			return Streamer{}, "", time.Time{}, e
-		}
 	}
 	return Streamer{ID: id.String(), Email: email, DisplayName: name, Active: true, CreatedAt: now}, token, exp, nil
 }
@@ -302,6 +315,11 @@ func (a *App) RotateOverlay(ctx context.Context, streamerID, ip, ua string) (str
 	exp := time.Now().UTC().Add(a.OverlayTTL)
 	sid := uuid.NewString()
 	var old sql.NullString
+	streamerUUID, err := uuid.Parse(streamerID)
+	if err != nil {
+		return "", "", time.Time{}, ErrInvalid
+	}
+	rotatedAt := time.Now().UTC()
 	err = tx(ctx, a.DB, func(t *sql.Tx) error {
 		_ = t.QueryRowContext(ctx, `SELECT last4 FROM sessions WHERE streamer_id=$1 AND purpose='OVERLAY' AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1`, streamerID).Scan(&old)
 		if _, e := t.ExecContext(ctx, `UPDATE sessions SET revoked_at=NOW() WHERE streamer_id=$1 AND purpose='OVERLAY' AND revoked_at IS NULL`, streamerID); e != nil {
@@ -310,16 +328,20 @@ func (a *App) RotateOverlay(ctx context.Context, streamerID, ip, ua string) (str
 		if _, e := t.ExecContext(ctx, `INSERT INTO sessions(id,streamer_id,token_hash,last4,purpose,expires_at) VALUES($1,$2,$3,$4,'OVERLAY',$5)`, sid, streamerID, h, last4(token), exp); e != nil {
 			return e
 		}
-		_, e := t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'STREAMER','TOKEN_ROTATE','STREAMER',$1,$2,$3)`, streamerID, ip, ua)
+		if _, e := t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'STREAMER','TOKEN_ROTATE','STREAMER',$1,$2,$3)`, streamerID, ip, ua); e != nil {
+			return e
+		}
+		envelope, e := events.NewEnvelope(events.OverlayTokenRotated, "tolkien", &streamerID, events.OverlayTokenRotatedEvent{StreamerID: streamerID, OldTokenLast4: old.String, NewTokenLast4: last4(token), RotatedAt: rotatedAt, ClientIP: ip})
+		if e != nil {
+			return e
+		}
+		_, e = outbox.Enqueue(ctx, t, "tolkien", "streamer", streamerUUID, &streamerUUID, envelope)
 		return e
 	})
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
 	a.Tokens.Clear()
-	if err = a.publish(ctx, events.OverlayTokenRotated, streamerID, events.OverlayTokenRotatedEvent{StreamerID: streamerID, OldTokenLast4: old.String, NewTokenLast4: last4(token), RotatedAt: time.Now().UTC(), ClientIP: ip}); err != nil {
-		return "", "", time.Time{}, err
-	}
 	return token, last4(token), exp, nil
 }
 
@@ -330,16 +352,30 @@ func (a *App) GetSettings(ctx context.Context, id string) (Settings, error) {
 	return s, err
 }
 
-// UpdateSettings validates and replaces a streamer's settings.
+// UpdateSettings validates and replaces a streamer's settings. The
+// streamer.settings.updated.v1 event is written to the transactional outbox
+// in the same DB transaction as the UPDATE (Phase 3 plan).
 func (a *App) UpdateSettings(ctx context.Context, s Settings) error {
-	if s.DisplayRate <= 0 || s.DisplayMin > s.DisplayMax || s.MinDonation < 1000 || s.MinDonation > s.MaxDonation {
+	if s.DisplayRate <= 0 || s.DisplayMin <= 0 || s.DisplayMax < s.DisplayMin || s.MinDonation < 1000 || s.MinDonation > s.MaxDonation {
 		return ErrInvalid
 	}
-	err := a.DB.QueryRowContext(ctx, `UPDATE streamer_settings SET display_rate_idr_per_sec=$2,display_min_sec=$3,display_max_sec=$4,show_donor_name=$5,allow_voice=$6,allow_youtube=$7,auto_play_voice=$8,auto_play_youtube=$9,notify_on_donation=$10,min_donation_idr=$11,max_donation_idr=$12,updated_at=NOW() WHERE streamer_id=$1 RETURNING updated_at`, s.StreamerID, s.DisplayRate, s.DisplayMin, s.DisplayMax, s.ShowDonor, s.AllowVoice, s.AllowYouTube, s.AutoVoice, s.AutoYouTube, s.Notify, s.MinDonation, s.MaxDonation).Scan(&s.UpdatedAt)
+	id, err := uuid.Parse(s.StreamerID)
 	if err != nil {
-		return err
+		return ErrInvalid
 	}
-	return a.publish(ctx, events.StreamerSettingsUpdated, s.StreamerID, events.StreamerSettingsUpdatedEvent{StreamerID: s.StreamerID, DisplayRateIDRPerSec: s.DisplayRate, DisplayMinSec: s.DisplayMin, DisplayMaxSec: s.DisplayMax, ShowDonorName: s.ShowDonor, AllowVoice: s.AllowVoice, AllowYouTube: s.AllowYouTube, AutoPlayVoice: s.AutoVoice, AutoPlayYouTube: s.AutoYouTube, NotifyOnDonation: s.Notify, MinDonationIDR: s.MinDonation, MaxDonationIDR: s.MaxDonation, UpdatedAt: s.UpdatedAt})
+	payload := events.StreamerSettingsUpdatedEvent{StreamerID: s.StreamerID, DisplayRateIDRPerSec: s.DisplayRate, DisplayMinSec: s.DisplayMin, DisplayMaxSec: s.DisplayMax, ShowDonorName: s.ShowDonor, AllowVoice: s.AllowVoice, AllowYouTube: s.AllowYouTube, AutoPlayVoice: s.AutoVoice, AutoPlayYouTube: s.AutoYouTube, NotifyOnDonation: s.Notify, MinDonationIDR: s.MinDonation, MaxDonationIDR: s.MaxDonation}
+	return tx(ctx, a.DB, func(t *sql.Tx) error {
+		if err := t.QueryRowContext(ctx, `UPDATE streamer_settings SET display_rate_idr_per_sec=$2,display_min_sec=$3,display_max_sec=$4,show_donor_name=$5,allow_voice=$6,allow_youtube=$7,auto_play_voice=$8,auto_play_youtube=$9,notify_on_donation=$10,min_donation_idr=$11,max_donation_idr=$12,updated_at=NOW() WHERE streamer_id=$1 RETURNING updated_at`, s.StreamerID, s.DisplayRate, s.DisplayMin, s.DisplayMax, s.ShowDonor, s.AllowVoice, s.AllowYouTube, s.AutoVoice, s.AutoYouTube, s.Notify, s.MinDonation, s.MaxDonation).Scan(&s.UpdatedAt); err != nil {
+			return err
+		}
+		payload.UpdatedAt = s.UpdatedAt
+		envelope, err := events.NewEnvelope(events.StreamerSettingsUpdated, "tolkien", &s.StreamerID, payload)
+		if err != nil {
+			return err
+		}
+		_, err = outbox.Enqueue(ctx, t, "tolkien", "streamer", id, &id, envelope)
+		return err
+	})
 }
 
 // Banks lists redacted bank accounts for a streamer.
@@ -398,16 +434,6 @@ func tx(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) error {
 	}
 	return t.Commit()
 }
-func (a *App) publish(ctx context.Context, topic, id string, payload any) error {
-	if a.Publisher == nil {
-		return nil
-	}
-	e, err := events.NewEnvelope(topic, "tolkien", &id, payload)
-	if err != nil {
-		return err
-	}
-	return a.Publisher.Publish(ctx, events.Subject(topic, id), e)
-}
 func last4(s string) string {
 	if len(s) < 4 {
 		return s
@@ -445,4 +471,19 @@ type principalKey struct{}
 // WithPrincipal attaches an authenticated principal to a request.
 func WithPrincipal(r *http.Request, p Principal) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), principalKey{}, p))
+}
+
+// AdminPrincipalFromRequest returns the admin principal attached by adminSession.
+func AdminPrincipalFromRequest(r *http.Request) (AdminPrincipal, bool) {
+	p, ok := r.Context().Value(adminPrincipalKey{}).(AdminPrincipal)
+	return p, ok
+}
+
+type adminPrincipalKey struct{}
+
+// WithAdminPrincipal attaches an authenticated admin principal to a request.
+// Admin principals use a distinct context key so an admin credential can never
+// be mistaken for a streamer session by the session-scoped handlers.
+func WithAdminPrincipal(r *http.Request, p AdminPrincipal) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), adminPrincipalKey{}, p))
 }

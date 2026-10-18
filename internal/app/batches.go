@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/frederickmarvel/inflora-shared/events"
+	"github.com/frederickmarvel/inflora-shared/outbox"
 	"github.com/google/uuid"
 )
 
@@ -30,8 +31,13 @@ func (a *App) CreateBatch(ctx context.Context, ids []string, auto bool, actor, i
 		return Batch{}, ErrInvalid
 	}
 	b := Batch{ID: uuid.NewString(), Status: "DRAFT", CreatedBy: actor, CreatedAt: time.Now().UTC()}
+	type selectedPayout struct {
+		id, streamerID, bankLast4 string
+		amount                    int64
+		requested                 time.Time
+	}
 	err := tx(ctx, a.DB, func(t *sql.Tx) error {
-		query := `SELECT p.id,p.streamer_id,p.amount_idr,p.requested_at FROM payouts p WHERE p.status='REQUESTED' AND p.batch_id IS NULL`
+		query := `SELECT p.id,p.streamer_id,p.amount_idr,p.requested_at,ba.account_number_last4 FROM payouts p JOIN streamer_bank_accounts ba ON ba.id=p.bank_account_id WHERE p.status='REQUESTED' AND p.batch_id IS NULL`
 		args := []any{}
 		if !auto {
 			if len(ids) == 0 {
@@ -47,25 +53,28 @@ func (a *App) CreateBatch(ctx context.Context, ids []string, auto bool, actor, i
 		}
 		defer func() { _ = rows.Close() }()
 		var selected, streamers []string
+		var payouts []selectedPayout
 		for rows.Next() {
-			var id, streamerID string
-			var amount int64
-			var requested time.Time
-			if err = rows.Scan(&id, &streamerID, &amount, &requested); err != nil {
+			var payout selectedPayout
+			if err = rows.Scan(&payout.id, &payout.streamerID, &payout.amount, &payout.requested, &payout.bankLast4); err != nil {
 				return err
 			}
-			selected = append(selected, id)
-			streamers = append(streamers, streamerID)
-			b.TotalAmountIDR += amount
+			selected = append(selected, payout.id)
+			streamers = append(streamers, payout.streamerID)
+			payouts = append(payouts, payout)
+			b.TotalAmountIDR += payout.amount
 			b.PayoutCount++
 			if b.FirstRequestedAt == nil {
-				x := requested
+				x := payout.requested
 				b.FirstRequestedAt = &x
 			}
-			x := requested
+			x := payout.requested
 			b.LastRequestedAt = &x
 		}
 		if err = rows.Err(); err != nil {
+			return err
+		}
+		if err = rows.Close(); err != nil {
 			return err
 		}
 		if b.PayoutCount == 0 || (!auto && b.PayoutCount != len(ids)) {
@@ -84,32 +93,29 @@ func (a *App) CreateBatch(ctx context.Context, ids []string, auto bool, actor, i
 		if _, err = t.ExecContext(ctx, `UPDATE payouts SET batch_id=$1,status='BATCHED' WHERE id=ANY($2::uuid[])`, b.ID, selected); err != nil {
 			return err
 		}
-		_, err = t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'FINOPS','BATCH_CREATED','PAYOUT_BATCH',$2,$3,$4)`, actor, b.ID, ip, userAgent)
-		return err
+		if _, err = t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'FINOPS','BATCH_CREATED','PAYOUT_BATCH',$2,$3,$4)`, actor, b.ID, ip, userAgent); err != nil {
+			return err
+		}
+		batchUUID := uuid.MustParse(b.ID)
+		for position, payout := range payouts {
+			streamerUUID, err := uuid.Parse(payout.streamerID)
+			if err != nil {
+				return err
+			}
+			envelope, err := events.NewEnvelope(events.PayoutBatched, "tolkien", &payout.streamerID, events.PayoutBatchedEvent{BatchID: b.ID, PayoutID: payout.id, StreamerID: payout.streamerID, AmountIDR: payout.amount, BankAccountLast4: payout.bankLast4, BatchTotalIDR: b.TotalAmountIDR, BatchPayoutCount: b.PayoutCount, FIFOPosition: position + 1, BatchedAt: b.CreatedAt})
+			if err != nil {
+				return err
+			}
+			if _, err = outbox.Enqueue(ctx, t, "tolkien", "payout_batch", batchUUID, &streamerUUID, envelope); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return Batch{}, err
 	}
-	rows, err := a.DB.QueryContext(ctx, `SELECT p.id,p.streamer_id,p.amount_idr,p.requested_at,ba.account_number_last4 FROM payouts p JOIN streamer_bank_accounts ba ON ba.id=p.bank_account_id WHERE p.batch_id=$1 ORDER BY p.requested_at,p.id`, b.ID)
-	if err != nil {
-		return Batch{}, err
-	}
-	defer func() { _ = rows.Close() }()
-	position := 0
-	for rows.Next() {
-		var payoutID, streamerID string
-		var bankLast4 string
-		var amount int64
-		var requested time.Time
-		if err = rows.Scan(&payoutID, &streamerID, &amount, &requested, &bankLast4); err != nil {
-			return Batch{}, err
-		}
-		position++
-		if err = a.publish(ctx, events.PayoutBatched, streamerID, events.PayoutBatchedEvent{BatchID: b.ID, PayoutID: payoutID, StreamerID: streamerID, AmountIDR: amount, BankAccountLast4: bankLast4, BatchTotalIDR: b.TotalAmountIDR, BatchPayoutCount: b.PayoutCount, FIFOPosition: position, BatchedAt: b.CreatedAt}); err != nil {
-			return Batch{}, err
-		}
-	}
-	return b, rows.Err()
+	return b, nil
 }
 
 // ListBatches returns batches matching an optional status filter.
@@ -163,8 +169,50 @@ func (a *App) ExecuteBatch(ctx context.Context, id, actor, ip, userAgent string)
 		if _, err = t.ExecContext(ctx, `UPDATE payouts SET status='PROCESSING',processed_at=$2 WHERE batch_id=$1 AND status='BATCHED'`, id, now); err != nil {
 			return err
 		}
-		_, err = t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'FINOPS','BATCH_EXECUTED','PAYOUT_BATCH',$2,$3,$4)`, actor, id, ip, userAgent)
-		return err
+		if _, err = t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'FINOPS','BATCH_EXECUTED','PAYOUT_BATCH',$2,$3,$4)`, actor, id, ip, userAgent); err != nil {
+			return err
+		}
+		rows, err := t.QueryContext(ctx, `SELECT id,streamer_id,amount_idr FROM payouts WHERE batch_id=$1 ORDER BY requested_at,id`, id)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		type executedPayout struct {
+			id, streamerID string
+			amount         int64
+		}
+		var payouts []executedPayout
+		for rows.Next() {
+			var payout executedPayout
+			if err = rows.Scan(&payout.id, &payout.streamerID, &payout.amount); err != nil {
+				return err
+			}
+			payouts = append(payouts, payout)
+		}
+		if err = rows.Err(); err != nil {
+			return err
+		}
+		if err = rows.Close(); err != nil {
+			return err
+		}
+		batchUUID, err := uuid.Parse(id)
+		if err != nil {
+			return err
+		}
+		for _, payout := range payouts {
+			streamerUUID, err := uuid.Parse(payout.streamerID)
+			if err != nil {
+				return err
+			}
+			envelope, err := events.NewEnvelope(events.PayoutBatchExecuted, "tolkien", &payout.streamerID, events.PayoutBatchExecutedEvent{BatchID: id, PayoutID: payout.id, StreamerID: payout.streamerID, AmountIDR: payout.amount, ProviderBatchID: providerRef, ProviderName: "unassigned", ExecutedAt: now})
+			if err != nil {
+				return err
+			}
+			if _, err = outbox.Enqueue(ctx, t, "tolkien", "payout_batch", batchUUID, &streamerUUID, envelope); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return Batch{}, err
@@ -172,22 +220,7 @@ func (a *App) ExecuteBatch(ctx context.Context, id, actor, ip, userAgent string)
 	b.Status = "EXECUTING"
 	b.ExecutingAt = &now
 	b.ProviderBatchID = &providerRef
-	rows, err := a.DB.QueryContext(ctx, `SELECT id,streamer_id,amount_idr FROM payouts WHERE batch_id=$1 ORDER BY requested_at`, id)
-	if err != nil {
-		return Batch{}, err
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var payoutID, streamerID string
-		var amount int64
-		if err = rows.Scan(&payoutID, &streamerID, &amount); err != nil {
-			return Batch{}, err
-		}
-		if err = a.publish(ctx, events.PayoutBatchExecuted, streamerID, events.PayoutBatchExecutedEvent{BatchID: id, PayoutID: payoutID, StreamerID: streamerID, AmountIDR: amount, ProviderBatchID: providerRef, ProviderName: "unassigned", ExecutedAt: now}); err != nil {
-			return Batch{}, err
-		}
-	}
-	return b, rows.Err()
+	return b, nil
 }
 
 // ResendReceipt queues an existing donation receipt for delivery.

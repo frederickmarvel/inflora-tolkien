@@ -7,15 +7,20 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	sharedconfig "github.com/frederickmarvel/inflora-shared/config"
 	shareddb "github.com/frederickmarvel/inflora-shared/db"
 	"github.com/frederickmarvel/inflora-shared/events"
+	"github.com/frederickmarvel/inflora-shared/middleware"
 	"github.com/frederickmarvel/inflora-shared/observability"
+	"github.com/frederickmarvel/inflora-shared/outbox"
+	sharedruntime "github.com/frederickmarvel/inflora-shared/runtime"
 	"github.com/frederickmarvel/inflora-tolkien/internal/app"
 	"github.com/frederickmarvel/inflora-tolkien/internal/httpapi"
+	"github.com/frederickmarvel/inflora-tolkien/internal/palantir"
 	"go.uber.org/zap"
 )
 
@@ -56,17 +61,78 @@ func main() {
 	application := app.New(database, publisher)
 	application.SessionTTL = cfg.Auth.SessionTTL
 	application.OverlayTTL = cfg.Auth.OverlayTokenTTL
-	server := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.New(application, internalKey).Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, stop := context.WithTimeout(context.Background(), 10*time.Second)
-		defer stop()
-		if shutdownErr := server.Shutdown(shutdownCtx); shutdownErr != nil {
-			logger.Error("shutdown http server", zap.Error(shutdownErr))
+
+	// Palantir owns provider state; the admin override is routed through it so
+	// an overridden donation produces exactly the same downstream events as a
+	// real gateway result.
+	palantirAddr := strings.TrimSpace(os.Getenv("PALANTIR_GRPC_ADDR"))
+	engineAPIKey := os.Getenv("SM_GATEWAY_ENGINE_API_KEY")
+	if palantirAddr != "" {
+		if engineAPIKey == "" {
+			logger.Fatal("SM_GATEWAY_ENGINE_API_KEY is required when PALANTIR_GRPC_ADDR is set")
 		}
-	}()
-	logger.Info("tolkien listening", zap.String("addr", cfg.HTTPAddr), zap.String("version", cfg.Version))
-	if err = server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Fatal("serve http", zap.Error(err))
+		palantirClient, err := palantir.New(ctx, palantirAddr, engineAPIKey)
+		if err != nil {
+			logger.Fatal("connect palantir", zap.Error(err))
+		}
+		defer func() { _ = palantirClient.Close() }()
+		application.PalantirAdmin = palantirClient
+		logger.Info("palantir admin client ready", zap.String("addr", palantirAddr))
+	} else {
+		logger.Warn("PALANTIR_GRPC_ADDR not set; admin donation override is disabled")
 	}
+	baseHandler := httpapi.New(application, internalKey).Handler()
+	corsHandler := middleware.CORS(middleware.CORSConfig{
+		AllowedOrigins: splitCSV(os.Getenv("CORS_ALLOWED_ORIGINS"), "https://app.inflora.app"),
+		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE"},
+		AllowedHeaders: []string{"Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"},
+		MaxAge:         600 * time.Second,
+	})(baseHandler)
+	server := &http.Server{Addr: cfg.HTTPAddr, Handler: corsHandler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	dispatcher, err := outbox.NewDispatcher(database, publisher, outbox.DispatcherConfig{WorkerName: "tolkien-outbox", Producer: "tolkien"})
+	if err != nil {
+		logger.Fatal("configure outbox", zap.Error(err))
+	}
+	logger.Info("tolkien listening", zap.String("addr", cfg.HTTPAddr), zap.String("version", cfg.Version))
+	probe := func(context.Context) (bool, error) { return database.PingContext(context.Background()) == nil, nil }
+	if err = sharedruntime.Run(ctx, 5*time.Second, 10*time.Second, probe, &httpWorker{server: server}, dispatcher); err != nil && !errors.Is(err, context.Canceled) {
+		logger.Error("shutdown", zap.Error(err))
+	}
+}
+
+type httpWorker struct{ server *http.Server }
+
+func (w *httpWorker) Name() string { return "tolkien-http" }
+func (w *httpWorker) Run(ctx context.Context) error {
+	errs := make(chan error, 1)
+	go func() { errs <- w.server.ListenAndServe() }()
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return w.server.Shutdown(shutdownCtx)
+	case err := <-errs:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
+
+// splitCSV parses a comma-separated env value, trimming whitespace, dropping
+// empty entries, and falling back to def when the value is empty. CORS
+// allowlist parsing.
+func splitCSV(v, def string) []string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return []string{def}
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
