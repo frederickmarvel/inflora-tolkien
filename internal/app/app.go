@@ -468,17 +468,21 @@ func (a *App) AddBank(ctx context.Context, id string, b BankAccount) error {
 
 // Balance returns the ledger balance projection and donation lifetime totals.
 func (a *App) Balance(ctx context.Context, id string) (map[string]any, error) {
+	months, err := a.earningsMonths(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	var p, av, paid, held int64
-	err := a.DB.QueryRowContext(ctx, `SELECT pending_idr,available_idr,paid_idr,held_idr FROM v_streamer_balances WHERE streamer_id=$1`, id).Scan(&p, &av, &paid, &held)
+	err = a.DB.QueryRowContext(ctx, `SELECT pending_idr,available_idr,paid_idr,held_idr FROM v_streamer_balances WHERE streamer_id=$1`, id).Scan(&p, &av, &paid, &held)
 	if err != nil && errors.Is(err, sql.ErrNoRows) {
-		return map[string]any{"currency": "IDR", "pending_idr": int64(0), "available_idr": int64(0), "held_idr": int64(0), "net_withdrawable_idr": int64(0), "lifetime_donations_count": int64(0), "lifetime_donations_idr": int64(0)}, nil
+		return map[string]any{"currency": "IDR", "pending_idr": int64(0), "available_idr": int64(0), "held_idr": int64(0), "net_withdrawable_idr": int64(0), "lifetime_donations_count": int64(0), "lifetime_donations_idr": int64(0), "months": months}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	var count, total int64
 	_ = a.DB.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(amount_idr),0) FROM donations WHERE streamer_id=$1 AND status IN ('CHARGED','SETTLED')`, id).Scan(&count, &total)
-	return map[string]any{"currency": "IDR", "pending_idr": p, "available_idr": av, "held_idr": held, "net_withdrawable_idr": av - held, "lifetime_donations_count": count, "lifetime_donations_idr": total}, nil
+	return map[string]any{"currency": "IDR", "pending_idr": p, "available_idr": av, "held_idr": held, "net_withdrawable_idr": av - held, "lifetime_donations_count": count, "lifetime_donations_idr": total, "months": months}, nil
 }
 
 func tx(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) error {
