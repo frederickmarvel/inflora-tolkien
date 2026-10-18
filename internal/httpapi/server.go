@@ -20,6 +20,8 @@ import (
 type Server struct {
 	App            *app.App
 	InternalKey    string
+	SarumanBaseURL string // internal decision proxy target (CONTRACT_DRIFT D-038)
+	SarumanClient  *http.Client
 	mux            *http.ServeMux
 	loginLimit     *middleware.RateLimiter
 	signupLimit    *middleware.RateLimiter
@@ -90,6 +92,10 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /v1/me/bank-accounts", s.session(http.HandlerFunc(s.banks)))
 	s.mux.Handle("POST /v1/me/bank-accounts", s.session(http.HandlerFunc(s.addBank)))
 	s.mux.Handle("POST /v1/me/overlay-token/rotate", s.session(http.HandlerFunc(s.rotate)))
+	// Donation review decision + queue (CONTRACT_DRIFT D-038): the decision
+	// proxies to saruman; the queue is a direct read of the shared database.
+	s.mux.Handle("POST /v1/me/donations/{id}/review", s.session(http.HandlerFunc(s.reviewDonation)))
+	s.mux.Handle("GET /v1/me/donations/review-queue", s.session(http.HandlerFunc(s.reviewQueue)))
 	s.mux.HandleFunc("POST /v1/internal/validate-overlay-token", s.internalValidate)
 	s.mux.HandleFunc("POST /v1/internal/send-receipt", s.internalReceipt)
 	s.mux.HandleFunc("POST /v1/admin/holds", s.createHold)

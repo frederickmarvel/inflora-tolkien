@@ -3,10 +3,12 @@ module github.com/frederickmarvel/inflora-tolkien
 go 1.25.0
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/frederickmarvel/inflora-shared v0.0.0-20261004060249-a7b56c86d72a
 	github.com/google/uuid v1.6.0
 	github.com/prometheus/client_golang v1.22.0
 	go.uber.org/zap v1.28.0
+	google.golang.org/grpc v1.84.0
 )
 
 require (
@@ -44,7 +46,6 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260706201446-f0a921348800 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
-	google.golang.org/grpc v1.84.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
 
