@@ -84,9 +84,13 @@ func main() {
 	baseHandler := httpapi.New(application, internalKey)
 	sarumanBaseURL := strings.TrimSpace(os.Getenv("SARUMAN_INTERNAL_URL"))
 	if sarumanBaseURL == "" {
-		logger.Warn("SARUMAN_INTERNAL_URL not set; donation review proxy is disabled")
+		logger.Warn("SARUMAN_INTERNAL_URL not set; donation review + payout proxies are disabled")
 	}
 	baseHandler.SarumanBaseURL = sarumanBaseURL
+	// The payout proxy rides the same internal URL and shared key as the review
+	// proxy (design T20): saruman's command handler checks X-Internal-Api-Key
+	// against its own INTERNAL_API_KEY, so the two services must share the value.
+	application.PayoutProxy = &app.PayoutProxy{SarumanInternalURL: sarumanBaseURL, InternalKey: internalKey}
 	corsHandler := middleware.CORS(middleware.CORSConfig{
 		AllowedOrigins: splitCSV(os.Getenv("CORS_ALLOWED_ORIGINS"), "https://app.inflora.app"),
 		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE"},

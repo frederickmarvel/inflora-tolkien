@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -176,7 +177,42 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	adminHeaders := map[string]string{"X-Internal-Api-Key": "integration-secret", "X-Actor-Id": testActorID}
+	// D-054: custody endpoints authenticate via `ak_` admin sessions — the
+	// internal key + X-Actor-Id path is dead and OPS is refused 403. Seed a
+	// FINOPS and an OPS admin, log in, and pin both behaviors plus the
+	// voucher-derived audit actor.
+	adminID, opsID := "90000000-0000-4000-8000-000000000010", "90000000-0000-4000-8000-000000000011"
+	if _, err = db.Exec(`INSERT INTO admin_users(id,email,display_name,password_hash,role) VALUES($1,'finops@example.com','FinOps',$2,'FINOPS'),($3,'ops@example.com','Ops',$2,'OPS')`, adminID, passwordHash, opsID); err != nil {
+		t.Fatal(err)
+	}
+	adminLogin := requestJSON(t, h, http.MethodPost, "/v1/admin/login", map[string]any{"email": "finops@example.com", "password": "correct-horse"}, nil)
+	if adminLogin.Code != http.StatusOK {
+		t.Fatalf("admin login: %d %s", adminLogin.Code, adminLogin.Body.String())
+	}
+	var adminLoginBody struct {
+		AdminToken string `json:"admin_token"`
+	}
+	decodeBody(t, adminLogin, &adminLoginBody)
+	if !strings.HasPrefix(adminLoginBody.AdminToken, "ak_") {
+		t.Fatalf("admin token prefix: %q", adminLoginBody.AdminToken)
+	}
+	adminHeaders := map[string]string{"Authorization": "Bearer " + adminLoginBody.AdminToken}
+	legacy := requestJSON(t, h, http.MethodPost, "/v1/admin/holds", map[string]any{"target_type": "STREAMER", "streamer_id": streamerID, "reason": "Legacy"}, map[string]string{"X-Internal-Api-Key": "integration-secret", "X-Actor-Id": testActorID})
+	if legacy.Code != http.StatusUnauthorized {
+		t.Fatalf("legacy internal-key custody must be dead: %d", legacy.Code)
+	}
+	opsLogin := requestJSON(t, h, http.MethodPost, "/v1/admin/login", map[string]any{"email": "ops@example.com", "password": "correct-horse"}, nil)
+	if opsLogin.Code != http.StatusOK {
+		t.Fatalf("ops login: %d %s", opsLogin.Code, opsLogin.Body.String())
+	}
+	var opsLoginBody struct {
+		AdminToken string `json:"admin_token"`
+	}
+	decodeBody(t, opsLogin, &opsLoginBody)
+	opsHold := requestJSON(t, h, http.MethodPost, "/v1/admin/holds", map[string]any{"target_type": "STREAMER", "streamer_id": streamerID, "reason": "Ops"}, map[string]string{"Authorization": "Bearer " + opsLoginBody.AdminToken})
+	if opsHold.Code != http.StatusForbidden {
+		t.Fatalf("ops hold must be 403: %d %s", opsHold.Code, opsHold.Body.String())
+	}
 	hold := requestJSON(t, h, http.MethodPost, "/v1/admin/holds", map[string]any{"target_type": "STREAMER", "streamer_id": streamerID, "reason": "Investigation"}, adminHeaders)
 	if hold.Code != http.StatusCreated {
 		t.Fatalf("hold: %d %s", hold.Code, hold.Body.String())
@@ -185,6 +221,10 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 		ID string `json:"hold_id"`
 	}
 	decodeBody(t, hold, &holdBody)
+	var holdCreatedBy string
+	if err = db.QueryRow(`SELECT created_by::text FROM fund_holds WHERE id=$1`, holdBody.ID).Scan(&holdCreatedBy); err != nil || holdCreatedBy != adminID {
+		t.Fatalf("hold created_by=%q err=%v, want voucher admin id", holdCreatedBy, err)
+	}
 	blocked := requestJSON(t, h, http.MethodPost, "/v1/admin/payout-batches", map[string]any{"auto_select": true}, adminHeaders)
 	if blocked.Code != http.StatusBadRequest {
 		t.Fatalf("blocked batch: %d %s", blocked.Code, blocked.Body.String())
@@ -222,13 +262,22 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 	if len(ids) != 5 || !strings.HasSuffix(ids[0], "000000000001") || !strings.HasSuffix(ids[4], "000000000005") {
 		t.Fatalf("FIFO ids: %v", ids)
 	}
+	// D-054: ExecuteBatch is an explicit no-op — it returns the batch's current
+	// state without transitioning it or its payouts.
 	execute := requestJSON(t, h, http.MethodPost, "/v1/admin/payout-batches/"+batchBody.ID+"/execute", map[string]any{}, adminHeaders)
 	if execute.Code != http.StatusOK {
 		t.Fatalf("execute: %d %s", execute.Code, execute.Body.String())
 	}
-	var processing int
-	if err = db.QueryRow(`SELECT COUNT(*) FROM payouts WHERE batch_id=$1 AND status='PROCESSING'`, batchBody.ID).Scan(&processing); err != nil || processing != 5 {
-		t.Fatalf("processing=%d err=%v", processing, err)
+	var executeBody struct {
+		Status string `json:"status"`
+	}
+	decodeBody(t, execute, &executeBody)
+	if executeBody.Status != "DRAFT" {
+		t.Fatalf("execute no-op: status=%q, want DRAFT", executeBody.Status)
+	}
+	var batched int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM payouts WHERE batch_id=$1 AND status='BATCHED'`, batchBody.ID).Scan(&batched); err != nil || batched != 5 {
+		t.Fatalf("batched=%d err=%v, want 5 untouched", batched, err)
 	}
 
 	var batchedCount, executedCount int
@@ -238,8 +287,8 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 	if err = db.QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id=$1 AND event_type=$2`, batchBody.ID, events.PayoutBatchExecuted).Scan(&executedCount); err != nil {
 		t.Fatal(err)
 	}
-	if batchedCount != 5 || executedCount != 5 {
-		t.Fatalf("outbox batch events: batched=%d executed=%d", batchedCount, executedCount)
+	if batchedCount != 5 || executedCount != 0 {
+		t.Fatalf("outbox batch events: batched=%d executed=%d (execute is a no-op)", batchedCount, executedCount)
 	}
 	var createdHolds, releasedHolds int
 	if err = db.QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id=$1 AND event_type=$2`, holdBody.ID, events.FundHoldCreated).Scan(&createdHolds); err != nil {
@@ -303,10 +352,24 @@ func resetSchema(t *testing.T, db *sql.DB) {
 		_, file, _, _ := runtime.Caller(0)
 		dir = filepath.Join(filepath.Dir(file), "..", "..", "..", "inflora-saruman", "migrations")
 	}
-	// Phase 3: apply the base init, the Phase 1 reliability migration and the
-	// P2 handles/live-sessions migration (CONTRACT_DRIFT D-033/D-037): signup
-	// writes streamers.handle and /v1/me reads live_sessions.
-	files := []string{"00001_init.up.sql", "00003_reliability.up.sql", "00009_streamer_handle_live_sessions.up.sql"}
+	// Apply the FULL non-seed schema in migration order: the handlers under test
+	// read columns shipped across several phases (e.g. earningsMonths reads
+	// ledger_transactions.source_tag from 00012), so a hand-picked subset
+	// silently diverges from the real stack. Dev seeds (00002/00008/00016)
+	// are excluded — fixtures seed exactly the rows each test needs.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read schema dir %s: %v", dir, err)
+	}
+	var files []string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".up.sql") || strings.Contains(name, "seed") {
+			continue
+		}
+		files = append(files, name)
+	}
+	sort.Strings(files)
 	for _, name := range files {
 		path := filepath.Join(dir, name)
 		schema, err := os.ReadFile(path)

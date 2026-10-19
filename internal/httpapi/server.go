@@ -18,15 +18,15 @@ import (
 
 // Server exposes Tolkien's HTTP routes.
 type Server struct {
-	App            *app.App
-	InternalKey    string
-	SarumanBaseURL string // internal decision proxy target (CONTRACT_DRIFT D-038)
-	SarumanClient  *http.Client
-	mux            *http.ServeMux
-	loginLimit     *middleware.RateLimiter
-	signupLimit    *middleware.RateLimiter
-	adminLimit     *middleware.RateLimiter
-	publicLimit    *middleware.RateLimiter
+	App             *app.App
+	InternalKey     string
+	SarumanBaseURL  string // internal decision proxy target (CONTRACT_DRIFT D-038)
+	SarumanClient   *http.Client
+	mux             *http.ServeMux
+	loginLimit      *middleware.RateLimiter
+	signupLimit     *middleware.RateLimiter
+	adminLimit      *middleware.RateLimiter
+	publicLimit     *middleware.RateLimiter
 	tipSessionLimit *middleware.RateLimiter
 }
 
@@ -92,19 +92,28 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /v1/me/bank-accounts", s.session(http.HandlerFunc(s.banks)))
 	s.mux.Handle("POST /v1/me/bank-accounts", s.session(http.HandlerFunc(s.addBank)))
 	s.mux.Handle("POST /v1/me/overlay-token/rotate", s.session(http.HandlerFunc(s.rotate)))
+	// Payout surface (design T18): the write proxies to saruman's payout
+	// machine (tolkien never writes money); the reads serve the frozen,
+	// surface-safe histories.
+	s.mux.Handle("POST /v1/me/payouts", s.session(http.HandlerFunc(s.createPayout)))
+	s.mux.Handle("GET /v1/me/payouts", s.session(http.HandlerFunc(s.listPayouts)))
+	s.mux.Handle("GET /v1/me/donations", s.session(http.HandlerFunc(s.listDonations)))
 	// Donation review decision + queue (CONTRACT_DRIFT D-038): the decision
 	// proxies to saruman; the queue is a direct read of the shared database.
 	s.mux.Handle("POST /v1/me/donations/{id}/review", s.session(http.HandlerFunc(s.reviewDonation)))
 	s.mux.Handle("GET /v1/me/donations/review-queue", s.session(http.HandlerFunc(s.reviewQueue)))
 	s.mux.HandleFunc("POST /v1/internal/validate-overlay-token", s.internalValidate)
 	s.mux.HandleFunc("POST /v1/internal/send-receipt", s.internalReceipt)
-	s.mux.HandleFunc("POST /v1/admin/holds", s.createHold)
-	s.mux.HandleFunc("GET /v1/admin/holds", s.listHolds)
-	s.mux.HandleFunc("DELETE /v1/admin/holds/{id}", s.releaseHold)
-	s.mux.HandleFunc("POST /v1/admin/payout-batches", s.createBatch)
-	s.mux.HandleFunc("GET /v1/admin/payout-batches", s.listBatches)
-	s.mux.HandleFunc("POST /v1/admin/payout-batches/{id}/execute", s.executeBatch)
-	s.mux.HandleFunc("POST /v1/admin/email-records/{donation_id}/resend", s.resendReceipt)
+	// Admin custody (CONTRACT_DRIFT D-054): holds and payout batches are gated
+	// by an `ak_` ADMIN or FINOPS session — not the internal API key and not
+	// the legacy client-supplied X-Actor-Id. OPS is refused 403.
+	s.mux.Handle("POST /v1/admin/holds", s.adminCustody(http.HandlerFunc(s.createHold)))
+	s.mux.Handle("GET /v1/admin/holds", s.adminCustody(http.HandlerFunc(s.listHolds)))
+	s.mux.Handle("DELETE /v1/admin/holds/{id}", s.adminCustody(http.HandlerFunc(s.releaseHold)))
+	s.mux.Handle("POST /v1/admin/payout-batches", s.adminCustody(http.HandlerFunc(s.createBatch)))
+	s.mux.Handle("GET /v1/admin/payout-batches", s.adminCustody(http.HandlerFunc(s.listBatches)))
+	s.mux.Handle("POST /v1/admin/payout-batches/{id}/execute", s.adminCustody(http.HandlerFunc(s.executeBatch)))
+	s.mux.Handle("POST /v1/admin/email-records/{donation_id}/resend", s.adminCustody(http.HandlerFunc(s.resendReceipt)))
 
 	// Admin monitoring surface. These are gated by an `ak_` admin session
 	// token rather than the internal API key, so the donation console is

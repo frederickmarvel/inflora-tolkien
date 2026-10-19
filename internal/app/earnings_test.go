@@ -82,10 +82,10 @@ func TestBalanceIncludesMonthsArray(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT date_trunc('month', lt.created_at)")).
 		WithArgs(streamerID, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"month", "source", "total"}))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT pending_idr,available_idr,paid_idr,held_idr FROM v_streamer_balances")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT pending_idr,available_idr,paid_idr,held_idr,disbursed_idr FROM v_streamer_balances")).
 		WithArgs(streamerID).
-		WillReturnRows(sqlmock.NewRows([]string{"pending_idr", "available_idr", "paid_idr", "held_idr"}).
-			AddRow(int64(1000), int64(2000), int64(0), int64(500)))
+		WillReturnRows(sqlmock.NewRows([]string{"pending_idr", "available_idr", "paid_idr", "held_idr", "disbursed_idr"}).
+			AddRow(int64(1000), int64(2000), int64(0), int64(500), int64(0)))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*),COALESCE(SUM(amount_idr),0) FROM donations")).
 		WithArgs(streamerID).
 		WillReturnRows(sqlmock.NewRows([]string{"count", "total"}).AddRow(int64(2), int64(3000)))
@@ -97,6 +97,9 @@ func TestBalanceIncludesMonthsArray(t *testing.T) {
 	}
 	if got["available_idr"] != int64(2000) || got["pending_idr"] != int64(1000) {
 		t.Fatalf("balance = %+v, want legacy keys intact", got)
+	}
+	if got["paid_idr"] != int64(0) || got["disbursed_idr"] != int64(0) {
+		t.Fatalf("balance = %+v, want payout paid/disbursed keys", got)
 	}
 	months, ok := got["months"].([]MonthlyEarnings)
 	if !ok || len(months) != 6 {

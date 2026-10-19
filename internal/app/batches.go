@@ -144,82 +144,31 @@ func (a *App) ListBatches(ctx context.Context, status string) ([]Batch, error) {
 	return out, rows.Err()
 }
 
-// ExecuteBatch transitions a draft batch and its payouts to processing.
-func (a *App) ExecuteBatch(ctx context.Context, id, actor, ip, userAgent string) (Batch, error) {
-	if _, err := uuid.Parse(actor); err != nil {
+// ExecuteBatch is an explicit no-op for Phase C (CONTRACT_DRIFT D-054): there
+// is no provider batch execution, so it returns the batch's current state
+// without transitioning it or its payouts. Batch lifecycle commands run
+// through saruman's internal command surface instead.
+func (a *App) ExecuteBatch(ctx context.Context, id string) (Batch, error) {
+	if _, err := uuid.Parse(id); err != nil {
 		return Batch{}, ErrInvalid
 	}
-	providerRef := "inflora-" + id
-	now := time.Now().UTC()
 	var b Batch
-	err := tx(ctx, a.DB, func(t *sql.Tx) error {
-		err := t.QueryRowContext(ctx, `SELECT id,status,total_amount_idr,payout_count,created_by,created_at FROM payout_batches WHERE id=$1 FOR UPDATE`, id).Scan(&b.ID, &b.Status, &b.TotalAmountIDR, &b.PayoutCount, &b.CreatedBy, &b.CreatedAt)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
-		if err != nil {
-			return err
-		}
-		if b.Status != "DRAFT" {
-			return ErrConflict
-		}
-		if _, err = t.ExecContext(ctx, `UPDATE payout_batches SET status='EXECUTING',executing_at=$2,provider_batch_id=$3 WHERE id=$1`, id, now, providerRef); err != nil {
-			return err
-		}
-		if _, err = t.ExecContext(ctx, `UPDATE payouts SET status='PROCESSING',processed_at=$2 WHERE batch_id=$1 AND status='BATCHED'`, id, now); err != nil {
-			return err
-		}
-		if _, err = t.ExecContext(ctx, `INSERT INTO audit_log(actor_id,actor_type,action,resource_type,resource_id,ip_address,user_agent) VALUES($1,'FINOPS','BATCH_EXECUTED','PAYOUT_BATCH',$2,$3,$4)`, actor, id, ip, userAgent); err != nil {
-			return err
-		}
-		rows, err := t.QueryContext(ctx, `SELECT id,streamer_id,amount_idr FROM payouts WHERE batch_id=$1 ORDER BY requested_at,id`, id)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = rows.Close() }()
-		type executedPayout struct {
-			id, streamerID string
-			amount         int64
-		}
-		var payouts []executedPayout
-		for rows.Next() {
-			var payout executedPayout
-			if err = rows.Scan(&payout.id, &payout.streamerID, &payout.amount); err != nil {
-				return err
-			}
-			payouts = append(payouts, payout)
-		}
-		if err = rows.Err(); err != nil {
-			return err
-		}
-		if err = rows.Close(); err != nil {
-			return err
-		}
-		batchUUID, err := uuid.Parse(id)
-		if err != nil {
-			return err
-		}
-		for _, payout := range payouts {
-			streamerUUID, err := uuid.Parse(payout.streamerID)
-			if err != nil {
-				return err
-			}
-			envelope, err := events.NewEnvelope(events.PayoutBatchExecuted, "tolkien", &payout.streamerID, events.PayoutBatchExecutedEvent{BatchID: id, PayoutID: payout.id, StreamerID: payout.streamerID, AmountIDR: payout.amount, ProviderBatchID: providerRef, ProviderName: "unassigned", ExecutedAt: now})
-			if err != nil {
-				return err
-			}
-			if _, err = outbox.Enqueue(ctx, t, "tolkien", "payout_batch", batchUUID, &streamerUUID, envelope); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	var provider sql.NullString
+	var executing sql.NullTime
+	err := a.DB.QueryRowContext(ctx, `SELECT id,status,total_amount_idr,payout_count,provider_batch_id,created_by,created_at,executing_at FROM payout_batches WHERE id=$1`, id).
+		Scan(&b.ID, &b.Status, &b.TotalAmountIDR, &b.PayoutCount, &provider, &b.CreatedBy, &b.CreatedAt, &executing)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Batch{}, ErrNotFound
+	}
 	if err != nil {
 		return Batch{}, err
 	}
-	b.Status = "EXECUTING"
-	b.ExecutingAt = &now
-	b.ProviderBatchID = &providerRef
+	if provider.Valid {
+		b.ProviderBatchID = &provider.String
+	}
+	if executing.Valid {
+		b.ExecutingAt = &executing.Time
+	}
 	return b, nil
 }
 
