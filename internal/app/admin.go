@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,8 +16,11 @@ import (
 )
 
 // AdminPrincipal is the authenticated admin-session identity attached to a
-// request. It carries the role so handlers can enforce least-privilege checks
-// without re-querying admin_users.
+// request. Role stays for the legacy rollback window (display only); Roles and
+// Perms carry the DB-authoritative RBAC set resolved per request from
+// admin_roles/roles/role_permissions so revocation is fresh (D-025).
+// FirebaseUID is set only for principals resolved from a verified Firebase ID
+// token; legacy ak_ sessions leave it empty.
 type AdminPrincipal struct {
 	AdminUserID string
 	SessionID   string
@@ -24,6 +28,9 @@ type AdminPrincipal struct {
 	DisplayName string
 	Role        string
 	ExpiresAt   time.Time
+	FirebaseUID string
+	Roles       []string
+	Perms       []string
 }
 
 // DonationOverrider issues trusted override instructions to Palantir, which
@@ -50,6 +57,15 @@ func (a *App) AdminLogin(ctx context.Context, email, password string) (string, t
 	if err != nil || !ok {
 		return "", time.Time{}, AdminPrincipal{}, ErrInvalid
 	}
+	return a.newAdminSession(ctx, id, email, name, role)
+}
+
+// newAdminSession issues the legacy opaque `ak_` session token and its row,
+// updates login state, and returns the principal with its DB-resolved RBAC
+// roles/permissions. It is the single admin session-issuance path shared by
+// AdminLogin (local password) and the Firebase exchange (verified Firebase
+// credential), so the admin_sessions row shape stays identical for both.
+func (a *App) newAdminSession(ctx context.Context, adminID, email, name, role string) (string, time.Time, AdminPrincipal, error) {
 	token, err := auth.GenerateAdminToken()
 	if err != nil {
 		return "", time.Time{}, AdminPrincipal{}, err
@@ -60,11 +76,16 @@ func (a *App) AdminLogin(ctx context.Context, email, password string) (string, t
 	}
 	exp := time.Now().UTC().Add(a.AdminTTL)
 	sid := uuid.NewString()
-	if _, err = a.DB.ExecContext(ctx, `INSERT INTO admin_sessions(id,admin_user_id,token_hash,last4,expires_at) VALUES($1,$2,$3,$4,$5)`, sid, id, th, last4(token), exp); err != nil {
+	if _, err = a.DB.ExecContext(ctx, `INSERT INTO admin_sessions(id,admin_user_id,token_hash,last4,expires_at) VALUES($1,$2,$3,$4,$5)`, sid, adminID, th, last4(token), exp); err != nil {
 		return "", time.Time{}, AdminPrincipal{}, err
 	}
-	_, _ = a.DB.ExecContext(ctx, `UPDATE admin_users SET last_login_at=NOW(),updated_at=NOW() WHERE id=$1`, id)
-	return token, exp, AdminPrincipal{AdminUserID: id, SessionID: sid, Email: email, DisplayName: name, Role: role, ExpiresAt: exp}, nil
+	_, _ = a.DB.ExecContext(ctx, `UPDATE admin_users SET last_login_at=NOW(),updated_at=NOW() WHERE id=$1`, adminID)
+	p := AdminPrincipal{AdminUserID: adminID, SessionID: sid, Email: email, DisplayName: name, Role: role, ExpiresAt: exp}
+	p.Roles, p.Perms, err = a.AdminRoleSets(ctx, adminID)
+	if err != nil {
+		return "", time.Time{}, AdminPrincipal{}, err
+	}
+	return token, exp, p, nil
 }
 
 // AdminValidate validates an opaque admin token against active hashes.
@@ -98,33 +119,87 @@ func (a *App) AdminValidate(ctx context.Context, token string) (AdminPrincipal, 
 			return AdminPrincipal{}, ErrExpired
 		}
 		_, _ = a.DB.ExecContext(ctx, `UPDATE admin_sessions SET last_used_at=NOW() WHERE id=$1`, p.SessionID)
+		// Roles/permissions resolve per request (fresh revocation, D-025).
+		p.Roles, p.Perms, err = a.AdminRoleSets(ctx, p.AdminUserID)
+		if err != nil {
+			return AdminPrincipal{}, err
+		}
 		return p, nil
 	}
 	return AdminPrincipal{}, ErrInvalid
 }
 
+// AdminRoleSets resolves the DB-authoritative roles and permissions for an
+// admin from admin_roles/roles/role_permissions (D-025). The legacy
+// admin_users.role column is NEVER read for authorization: an admin whose
+// admin_roles rows were removed resolves with zero permissions until
+// re-granted, so role removal is a real revocation (the legacy fallback made
+// it a non-revocation — the old column value kept granting forever). An admin
+// with no rows at all still resolves as a principal (e.g. /v1/admin/me) but
+// passes no requirePerm gate.
+func (a *App) AdminRoleSets(ctx context.Context, adminUserID string) ([]string, []string, error) {
+	rows, err := a.DB.QueryContext(ctx, `
+		SELECT r.name::text, p.name
+		FROM admin_roles ar
+		JOIN roles r ON r.id = ar.role_id
+		LEFT JOIN role_permissions rp ON rp.role_id = r.id
+		LEFT JOIN permissions p ON p.id = rp.permission_id
+		WHERE ar.admin_user_id = $1`, adminUserID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	roleSet := make(map[string]bool)
+	permSet := make(map[string]bool)
+	for rows.Next() {
+		var roleName string
+		var permName sql.NullString
+		if err := rows.Scan(&roleName, &permName); err != nil {
+			return nil, nil, err
+		}
+		roleSet[roleName] = true
+		if permName.Valid {
+			permSet[permName.String] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return keysOf(roleSet), keysOf(permSet), nil
+}
+
+// keysOf returns the map keys sorted for deterministic ordering.
+func keysOf(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // AdminDonation is the list-row projection of a donation for the admin UI.
 type AdminDonation struct {
-	DonationID        string     `json:"donation_id"`
-	StreamerID        string     `json:"streamer_id"`
-	StreamerName      string     `json:"streamer_display_name"`
-	Status            string     `json:"status"`
-	SettlementStatus  string     `json:"settlement_status"`
-	AmountIDR         int64      `json:"amount_idr"`
-	GrossChargedIDR   int64      `json:"gross_charged_idr"`
-	MDRIDR            int64      `json:"mdr_idr"`
-	PlatformFeeIDR    int64      `json:"platform_fee_idr"`
-	NetIDR            int64      `json:"net_idr"`
-	DonorName         string     `json:"donor_display_name"`
-	IsAnonymous       bool       `json:"is_anonymous"`
-	Message           string     `json:"message"`
-	Provider          string     `json:"provider"`
-	ProviderChargeID  string     `json:"provider_charge_id"`
-	PaymentMethod     string     `json:"payment_method"`
-	GatewayStatus     string     `json:"gateway_status"`
-	CreatedAt         time.Time  `json:"created_at"`
-	ChargedAt         *time.Time `json:"charged_at"`
-	FailedAt          *time.Time `json:"failed_at"`
+	DonationID       string     `json:"donation_id"`
+	StreamerID       string     `json:"streamer_id"`
+	StreamerName     string     `json:"streamer_display_name"`
+	Status           string     `json:"status"`
+	SettlementStatus string     `json:"settlement_status"`
+	AmountIDR        int64      `json:"amount_idr"`
+	GrossChargedIDR  int64      `json:"gross_charged_idr"`
+	MDRIDR           int64      `json:"mdr_idr"`
+	PlatformFeeIDR   int64      `json:"platform_fee_idr"`
+	NetIDR           int64      `json:"net_idr"`
+	DonorName        string     `json:"donor_display_name"`
+	IsAnonymous      bool       `json:"is_anonymous"`
+	Message          string     `json:"message"`
+	Provider         string     `json:"provider"`
+	ProviderChargeID string     `json:"provider_charge_id"`
+	PaymentMethod    string     `json:"payment_method"`
+	GatewayStatus    string     `json:"gateway_status"`
+	CreatedAt        time.Time  `json:"created_at"`
+	ChargedAt        *time.Time `json:"charged_at"`
+	FailedAt         *time.Time `json:"failed_at"`
 }
 
 const adminDonationColumns = `d.id, d.streamer_id, s.display_name, d.status::text, d.settlement_status::text,
@@ -192,15 +267,15 @@ func (a *App) AdminListDonations(ctx context.Context, statusFilter, streamerID s
 
 // AdminDonationSummary is the aggregate monitoring view for the admin home.
 type AdminDonationSummary struct {
-	Total             int64 `json:"total"`
-	IntentCreated     int64 `json:"intent_created"`
-	Charged           int64 `json:"charged"`
-	Settled           int64 `json:"settled"`
-	Failed            int64 `json:"failed"`
-	Refunded          int64 `json:"refunded"`
-	GrossIDR          int64 `json:"gross_idr"`
-	NetSettledIDR     int64 `json:"net_settled_idr"`
-	PendingIntentIDR  int64 `json:"pending_intent_idr"`
+	Total            int64 `json:"total"`
+	IntentCreated    int64 `json:"intent_created"`
+	Charged          int64 `json:"charged"`
+	Settled          int64 `json:"settled"`
+	Failed           int64 `json:"failed"`
+	Refunded         int64 `json:"refunded"`
+	GrossIDR         int64 `json:"gross_idr"`
+	NetSettledIDR    int64 `json:"net_settled_idr"`
+	PendingIntentIDR int64 `json:"pending_intent_idr"`
 }
 
 // AdminDonationSummary computes cross-cutting donation counts and totals.
@@ -234,9 +309,9 @@ type AdminLedgerEntry struct {
 // AdminDonationDetail is the full donation record for a single admin view.
 type AdminDonationDetail struct {
 	AdminDonation
-	DonorEmail  string             `json:"donor_email"`
-	IntentID    string             `json:"intent_id"`
-	Ledger      []AdminLedgerEntry `json:"ledger_entries"`
+	DonorEmail string             `json:"donor_email"`
+	IntentID   string             `json:"intent_id"`
+	Ledger     []AdminLedgerEntry `json:"ledger_entries"`
 }
 
 // AdminGetDonation returns one donation with its gateway state and ledger

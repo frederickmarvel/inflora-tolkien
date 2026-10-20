@@ -20,6 +20,9 @@ import (
 	shareddb "github.com/frederickmarvel/inflora-shared/db"
 	"github.com/frederickmarvel/inflora-shared/events"
 	"github.com/frederickmarvel/inflora-tolkien/internal/app"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 const testActorID = "90000000-0000-4000-8000-000000000001"
@@ -177,12 +180,17 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// D-054: custody endpoints authenticate via `ak_` admin sessions — the
-	// internal key + X-Actor-Id path is dead and OPS is refused 403. Seed a
-	// FINOPS and an OPS admin, log in, and pin both behaviors plus the
-	// voucher-derived audit actor.
+	// D-054/D-025: custody endpoints authenticate via `ak_` admin sessions —
+	// the internal key + X-Actor-Id path is dead, and the legacy admin_users
+	// role column grants NOTHING (authorization reads admin_roles only). Seed
+	// a FinOps admin and an OPS admin: the FinOps admin is explicitly granted
+	// the seeded ADMIN role, the OPS admin is left with its legacy 'OPS' value
+	// alone, which resolves to zero permissions and must be refused 403.
 	adminID, opsID := "90000000-0000-4000-8000-000000000010", "90000000-0000-4000-8000-000000000011"
 	if _, err = db.Exec(`INSERT INTO admin_users(id,email,display_name,password_hash,role) VALUES($1,'finops@example.com','FinOps',$2,'FINOPS'),($3,'ops@example.com','Ops',$2,'OPS')`, adminID, passwordHash, opsID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO admin_roles(admin_user_id,role_id,granted_by) SELECT $1,r.id,$1 FROM roles r WHERE r.name='ADMIN'`, adminID); err != nil {
 		t.Fatal(err)
 	}
 	adminLogin := requestJSON(t, h, http.MethodPost, "/v1/admin/login", map[string]any{"email": "finops@example.com", "password": "correct-horse"}, nil)
@@ -316,6 +324,139 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 	}
 	if payload.BatchTotalIDR != 60000 || payload.BatchPayoutCount != 5 || payload.FIFOPosition < 1 || payload.FIFOPosition > 5 || payload.BankAccountLast4 != "4321" {
 		t.Fatalf("batch event: %#v", payload)
+	}
+}
+
+// TestBridgeReadsFirebaseConfigAtRequestTime pins the wiring order the
+// production cmd depends on: New() registers routes before main() populates
+// FirebaseCfg/FirebaseVerifyMode/Logger, so the bridge middleware must read
+// those fields at request time. A stale registration-time snapshot would
+// permanently deny every real Firebase token with the D-029 no-project branch
+// (401 with no degraded WARN and no journal) despite valid environment config.
+// This test sets the fields the way main() does — after New() — and asserts
+// the outage-class path actually fires: degraded WARN plus one
+// BREAKGLASS_DEGRADED_AUTH journal row (JWKSURL answers 500, an outage, not a
+// client error).
+func TestBridgeReadsFirebaseConfigAtRequestTime(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	db, err := shareddb.Open(context.Background(), shareddb.Config{DSN: dsn, MaxOpenConns: 5, MaxIdleConns: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	resetSchema(t, db)
+	defer resetEmptySchema(t, db)
+	application := app.New(db, nil)
+
+	// Mirror cmd/server/main.go: construct the server with no Firebase config,
+	// wire the real logger, mode and FirebaseConfig afterwards.
+	s := New(application, "integration-secret")
+	core, observed := observer.New(zapcore.DebugLevel)
+	s.Logger = zap.New(core)
+	s.FirebaseVerifyMode = "degraded"
+	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer jwks.Close()
+	s.FirebaseCfg = auth.FirebaseConfig{ProjectID: "inflora-dev", JWKSURL: jwks.URL}
+	h := s.Handler()
+
+	// Firebase-shaped token: 3-part JWS, RS256, kid present — verification
+	// must reach the JWKS fetch, which fails as an outage (HTTP 500).
+	const firebaseShaped = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2lkIn0." +
+		"eyJpc3MiOiJodHRwczovL3NlY3VyZXRva2VuLmdvb2dsZS5jb20vaW5mbG9yYS1kZXYiLCJhdWQiOiJpbmZsb3JhLWRldiIsInN1YiI6ImZhYWYtdWlkIiwibWFpbCI6ImZhYWZAdGVzdCJ9.ZmFrZQ"
+	res := requestJSON(t, h, http.MethodGet, "/v1/me", nil, map[string]string{"Authorization": "Bearer " + firebaseShaped})
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("firebase-shaped token: %d, want 401", res.Code)
+	}
+	// The degraded WARN proves the bridge read the post-construction config —
+	// the stale-snapshot bug answers the same 401 with no WARN at all.
+	if n := observed.FilterMessage("firebase verification failed; denied in degraded break-glass mode").Len(); n == 0 {
+		t.Fatal("bridge used a registration-time FirebaseConfig snapshot: degraded WARN missing")
+	}
+	// Outage-class failures journal exactly once for operator visibility.
+	var journaled int
+	if err := db.QueryRow(`SELECT count(*) FROM audit_log WHERE action='BREAKGLASS_DEGRADED_AUTH'`).Scan(&journaled); err != nil {
+		t.Fatal(err)
+	}
+	if journaled != 1 {
+		t.Fatalf("BREAKGLASS journal rows: %d, want 1", journaled)
+	}
+}
+// TestBridgeSurfaceKindMismatch pins the frozen surface split the Phase-A
+// bridge must preserve: a streamer credential (sk_) is invalid on backoffice
+// surfaces and an admin credential (ak_) is invalid on streamer surfaces —
+// both answer 401 INVALID_TOKEN exactly like the frozen session()/
+// adminSession() middleware, instead of cross-resolving to the wrong
+// principal or falling through to a permission-shaped 403.
+func TestBridgeSurfaceKindMismatch(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	db, err := shareddb.Open(context.Background(), shareddb.Config{DSN: dsn, MaxOpenConns: 5, MaxIdleConns: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	resetSchema(t, db)
+	defer resetEmptySchema(t, db)
+	application := app.New(db, nil)
+	h := New(application, "integration-secret").Handler()
+
+	signup := requestJSON(t, h, http.MethodPost, "/v1/auth/signup", map[string]any{"email": "surface@example.com", "password": "correct-horse", "display_name": "Surface"}, nil)
+	if signup.Code != http.StatusCreated {
+		t.Fatalf("signup: %d %s", signup.Code, signup.Body.String())
+	}
+	var signupBody struct {
+		SessionToken string `json:"session_token"`
+	}
+	decodeBody(t, signup, &signupBody)
+	streamerHeaders := map[string]string{"Authorization": "Bearer " + signupBody.SessionToken}
+
+	surfaceAdmin := "90000000-0000-4000-8000-000000000020"
+	passwordHash, err := auth.HashPassword("correct-horse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO admin_users(id,email,display_name,password_hash,role) VALUES($1,'surface-admin@example.com','Surface Admin',$2,'ADMIN')`, surfaceAdmin, passwordHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO admin_roles(admin_user_id,role_id,granted_by) SELECT $1,r.id,$1 FROM roles r WHERE r.name='ADMIN'`, surfaceAdmin); err != nil {
+		t.Fatal(err)
+	}
+	adminLogin := requestJSON(t, h, http.MethodPost, "/v1/admin/login", map[string]any{"email": "surface-admin@example.com", "password": "correct-horse"}, nil)
+	if adminLogin.Code != http.StatusOK {
+		t.Fatalf("admin login: %d %s", adminLogin.Code, adminLogin.Body.String())
+	}
+	var adminLoginBody struct {
+		AdminToken string `json:"admin_token"`
+	}
+	decodeBody(t, adminLogin, &adminLoginBody)
+	adminHeaders := map[string]string{"Authorization": "Bearer " + adminLoginBody.AdminToken}
+
+	// ak_ on the streamer surface: the frozen session() rejected it as an
+	// invalid streamer session; the bridge must answer the same 401.
+	akOnStreamer := requestJSON(t, h, http.MethodGet, "/v1/me", nil, adminHeaders)
+	if akOnStreamer.Code != http.StatusUnauthorized {
+		t.Fatalf("ak_ on streamer surface: %d, want 401", akOnStreamer.Code)
+	}
+	// sk_ on the backoffice surface: the frozen adminSession() rejected it.
+	skOnAdmin := requestJSON(t, h, http.MethodGet, "/v1/admin/me", nil, streamerHeaders)
+	if skOnAdmin.Code != http.StatusUnauthorized {
+		t.Fatalf("sk_ on admin surface: %d, want 401", skOnAdmin.Code)
+	}
+	// Each kind still works on its own surface.
+	me := requestJSON(t, h, http.MethodGet, "/v1/me", nil, streamerHeaders)
+	if me.Code != http.StatusOK {
+		t.Fatalf("me: %d %s", me.Code, me.Body.String())
+	}
+	adminMe := requestJSON(t, h, http.MethodGet, "/v1/admin/me", nil, adminHeaders)
+	if adminMe.Code != http.StatusOK {
+		t.Fatalf("admin me: %d %s", adminMe.Code, adminMe.Body.String())
 	}
 }
 

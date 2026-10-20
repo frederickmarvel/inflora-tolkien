@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	sharedauth "github.com/frederickmarvel/inflora-shared/auth"
 	sharedconfig "github.com/frederickmarvel/inflora-shared/config"
 	shareddb "github.com/frederickmarvel/inflora-shared/db"
 	"github.com/frederickmarvel/inflora-shared/events"
@@ -19,12 +20,18 @@ import (
 	"github.com/frederickmarvel/inflora-shared/outbox"
 	sharedruntime "github.com/frederickmarvel/inflora-shared/runtime"
 	"github.com/frederickmarvel/inflora-tolkien/internal/app"
+	tolkienconfig "github.com/frederickmarvel/inflora-tolkien/internal/config"
 	"github.com/frederickmarvel/inflora-tolkien/internal/httpapi"
 	"github.com/frederickmarvel/inflora-tolkien/internal/palantir"
 	"go.uber.org/zap"
 )
 
 func main() {
+	// Hidden Phase-A operator subcommands (e.g. `tolkien admin bootstrap`),
+	// handled before any server wiring.
+	if runAdminCommand(os.Args) {
+		return
+	}
 	cfg, err := sharedconfig.Load("tolkien")
 	if err != nil {
 		panic(err)
@@ -82,6 +89,21 @@ func main() {
 		logger.Warn("PALANTIR_GRPC_ADDR not set; admin donation override is disabled")
 	}
 	baseHandler := httpapi.New(application, internalKey)
+	// Phase-A identity wiring: the bridge middleware and the exchange endpoint
+	// verify Firebase ID tokens with these pinned parameters (D-024).
+	firebaseEnv := tolkienconfig.LoadFirebase()
+	if firebaseEnv.ProjectID == "" {
+		logger.Warn("FIREBASE_PROJECT_ID not set; Firebase authentication is disabled (legacy sessions still work)")
+	}
+	baseHandler.FirebaseCfg = sharedauth.FirebaseConfig{
+		ProjectID:    firebaseEnv.ProjectID,
+		TokenIssuer:  firebaseEnv.TokenIssuer,
+		JWKSURL:      firebaseEnv.JWKSURL,
+		JWKSCacheTTL: firebaseEnv.JWKSCacheTTL,
+	}
+	baseHandler.FirebaseVerifyMode = firebaseEnv.VerifyMode
+	baseHandler.LegacyAuthEnabled = firebaseEnv.LegacyAuthEnabled
+	baseHandler.Logger = logger
 	sarumanBaseURL := strings.TrimSpace(os.Getenv("SARUMAN_INTERNAL_URL"))
 	if sarumanBaseURL == "" {
 		logger.Warn("SARUMAN_INTERNAL_URL not set; donation review + payout proxies are disabled")

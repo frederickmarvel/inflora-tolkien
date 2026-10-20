@@ -35,6 +35,13 @@ var (
 	// violate an invariant the consumer enforces. Callers surface it as an
 	// actionable error instead of a generic failure.
 	ErrInconsistent = errors.New("inconsistent state")
+	// ErrIdentityNotFound indicates a verified credential with no principal to
+	// resolve to (Phase-A Firebase exchange: backoffice identities are never
+	// auto-provisioned).
+	ErrIdentityNotFound = errors.New("identity not found")
+	// ErrAdminInactive indicates a resolved backoffice identity is disabled.
+	// Distinct from ErrInactive so callers can map 403 ADMIN_INACTIVE.
+	ErrAdminInactive = errors.New("admin inactive")
 	// errHandleCollision rebinds signup to a fresh handle suffix.
 	errHandleCollision = errors.New("handle collision")
 )
@@ -103,8 +110,11 @@ type cachedToken struct {
 }
 
 // Principal is the authenticated session identity attached to a request.
+// FirebaseUID is set only for principals resolved from a verified Firebase ID
+// token (Phase A); legacy opaque sessions leave it empty.
 type Principal struct {
 	StreamerID, SessionID string
+	FirebaseUID           string
 	ExpiresAt             time.Time
 }
 
@@ -272,6 +282,15 @@ func (a *App) Login(ctx context.Context, email, password string) (string, time.T
 	if err != nil || !ok {
 		return "", time.Time{}, Principal{}, ErrInvalid
 	}
+	return a.newSession(ctx, id)
+}
+
+// newSession issues the legacy opaque streamer session token and its row,
+// updates login state, and returns the principal. It is the single
+// session-issuance path shared by Login (password credential) and the
+// Firebase exchange (verified Firebase credential), so the sessions row shape
+// stays identical for both credential kinds.
+func (a *App) newSession(ctx context.Context, streamerID string) (string, time.Time, Principal, error) {
 	token, err := auth.GenerateSessionToken()
 	if err != nil {
 		return "", time.Time{}, Principal{}, err
@@ -282,11 +301,11 @@ func (a *App) Login(ctx context.Context, email, password string) (string, time.T
 	}
 	exp := time.Now().UTC().Add(a.SessionTTL)
 	sid := uuid.NewString()
-	if _, err = a.DB.ExecContext(ctx, `INSERT INTO sessions(id,streamer_id,token_hash,last4,purpose,expires_at) VALUES($1,$2,$3,$4,'SESSION',$5)`, sid, id, th, last4(token), exp); err != nil {
+	if _, err = a.DB.ExecContext(ctx, `INSERT INTO sessions(id,streamer_id,token_hash,last4,purpose,expires_at) VALUES($1,$2,$3,$4,'SESSION',$5)`, sid, streamerID, th, last4(token), exp); err != nil {
 		return "", time.Time{}, Principal{}, err
 	}
-	_, _ = a.DB.ExecContext(ctx, `UPDATE streamers SET last_login_at=NOW(),updated_at=NOW() WHERE id=$1`, id)
-	return token, exp, Principal{StreamerID: id, SessionID: sid, ExpiresAt: exp}, nil
+	_, _ = a.DB.ExecContext(ctx, `UPDATE streamers SET last_login_at=NOW(),updated_at=NOW() WHERE id=$1`, streamerID)
+	return token, exp, Principal{StreamerID: streamerID, SessionID: sid, ExpiresAt: exp}, nil
 }
 
 // ValidateSession validates an opaque session token against active bcrypt hashes.

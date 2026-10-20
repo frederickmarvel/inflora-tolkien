@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/frederickmarvel/inflora-tolkien/internal/app"
 )
@@ -66,9 +68,23 @@ func (s *Server) adminLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
+// adminMe serves the backoffice principal from either credential kind (ak_
+// session or Firebase-resolved). Roles/permissions are display-only (D-025):
+// every guarded route re-checks the DB-resolved set per request.
 func (s *Server) adminMe(w http.ResponseWriter, r *http.Request) {
-	p, _ := app.AdminPrincipalFromRequest(r)
-	app.JSON(w, adminView(p), 200)
+	p, ok := app.AdminPrincipalFromRequest(r)
+	if !ok {
+		app.Error(w, r, 401, "INVALID_TOKEN", "invalid credential")
+		return
+	}
+	roles, perms := p.Roles, p.Perms
+	if roles == nil {
+		roles = []string{}
+	}
+	if perms == nil {
+		perms = []string{}
+	}
+	app.JSON(w, map[string]any{"admin": adminView(p), "roles": roles, "permissions": perms}, 200)
 }
 
 func (s *Server) adminDonations(w http.ResponseWriter, r *http.Request) {
@@ -150,12 +166,17 @@ func (s *Server) adminDonationOverride(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminView(p app.AdminPrincipal) map[string]any {
+	var fuid *string
+	if p.FirebaseUID != "" {
+		fuid = &p.FirebaseUID
+	}
 	return map[string]any{
 		"id":           p.AdminUserID,
 		"email":        p.Email,
 		"display_name": p.DisplayName,
 		"role":         p.Role,
 		"expires_at":   p.ExpiresAt,
+		"firebase_uid": fuid,
 	}
 }
 
@@ -169,4 +190,72 @@ func cursorOrNil(cursor string) any {
 // adminLoginLimited bounds admin login attempts per client IP.
 func (s *Server) adminLoginLimited(next http.Handler) http.Handler {
 	return s.rateLimit(s.adminLimit, next)
+}
+
+// auditEntry is one audit_log row for the Audit:Read console.
+type auditEntry struct {
+	ID           string          `json:"id"`
+	ActorID      *string         `json:"actor_id"`
+	ActorType    string          `json:"actor_type"`
+	Action       string          `json:"action"`
+	ResourceType string          `json:"resource_type"`
+	ResourceID   *string         `json:"resource_id"`
+	IPAddress    *string         `json:"ip_address"`
+	UserAgent    *string         `json:"user_agent"`
+	Metadata     json.RawMessage `json:"metadata"`
+	CreatedAt    time.Time       `json:"created_at"`
+}
+
+// adminAudit serves the recent audit trail newest-first (Audit:Read only).
+func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	offset, _ := strconv.Atoi(q.Get("offset"))
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.App.DB.QueryContext(r.Context(), `SELECT id::text, COALESCE(actor_id::text,''), actor_type, action, resource_type, COALESCE(resource_id::text,''), COALESCE(host(ip_address),''), COALESCE(user_agent,''), COALESCE(metadata::text,'{}'), created_at FROM audit_log ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`, limit+1, offset)
+	if err != nil {
+		app.Error(w, r, 500, "INTERNAL", "could not read audit log")
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]auditEntry, 0, limit)
+	for rows.Next() {
+		var e auditEntry
+		var actorID, resourceID, ipAddress, userAgent, meta string
+		if err = rows.Scan(&e.ID, &actorID, &e.ActorType, &e.Action, &e.ResourceType, &resourceID, &ipAddress, &userAgent, &meta, &e.CreatedAt); err != nil {
+			app.Error(w, r, 500, "INTERNAL", "could not read audit log")
+			return
+		}
+		e.ActorID = nonEmptyOrNil(actorID)
+		e.ResourceID = nonEmptyOrNil(resourceID)
+		e.IPAddress = nonEmptyOrNil(ipAddress)
+		e.UserAgent = nonEmptyOrNil(userAgent)
+		e.Metadata = json.RawMessage(meta)
+		out = append(out, e)
+	}
+	if err = rows.Err(); err != nil {
+		app.Error(w, r, 500, "INTERNAL", "could not read audit log")
+		return
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	nextCursor := ""
+	if hasMore && len(out) > 0 {
+		nextCursor = strconv.Itoa(offset + len(out))
+	}
+	app.JSON(w, map[string]any{"data": out, "pagination": map[string]any{"next_cursor": cursorOrNil(nextCursor), "has_more": hasMore}}, 200)
+}
+
+func nonEmptyOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
