@@ -143,6 +143,16 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /v1/admin/users", s.adminBridge(s.requirePerm(PermAdminManage, http.HandlerFunc(s.adminCreateUser))))
 	s.mux.Handle("PATCH /v1/admin/users/{id}", s.adminBridge(s.requirePerm(PermAdminManage, http.HandlerFunc(s.adminPatchUser))))
 	s.mux.Handle("POST /v1/admin/users/{id}/roles", s.adminBridge(s.requirePerm(PermAdminManage, http.HandlerFunc(s.adminAssignRole))))
+
+	// Marvel backoffice surfaces (CONTRACT_DRIFT D-064): streamer management
+	// incl. the per-streamer platform fee (D-060), the withdrawal request
+	// queue, one batch's drill-down, and the mdr_rates CRUD (D-061).
+	s.mux.Handle("GET /v1/admin/streamers", s.adminBridge(s.requirePerm(PermStreamerRead, http.HandlerFunc(s.adminStreamers))))
+	s.mux.Handle("PATCH /v1/admin/streamers/{id}", s.adminBridge(s.requirePerm(PermStreamerWrite, http.HandlerFunc(s.adminUpdateStreamer))))
+	s.mux.Handle("GET /v1/admin/payout-requests", s.adminBridge(s.requirePerm(PermPayoutReview, http.HandlerFunc(s.adminPayoutRequests))))
+	s.mux.Handle("GET /v1/admin/payout-batches/{id}", s.adminBridge(s.requirePerm(PermPayoutBatchRead, http.HandlerFunc(s.adminBatchDetail))))
+	s.mux.Handle("GET /v1/admin/mdr-rates", s.adminBridge(s.requirePerm(PermMdrRateRead, http.HandlerFunc(s.adminListMdrRates))))
+	s.mux.Handle("PUT /v1/admin/mdr-rates", s.adminBridge(s.requirePerm(PermMdrRateWrite, http.HandlerFunc(s.adminUpsertMdrRate))))
 }
 func (s *Server) rateLimit(l *middleware.RateLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

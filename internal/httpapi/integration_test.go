@@ -270,8 +270,27 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 	if len(ids) != 5 || !strings.HasSuffix(ids[0], "000000000001") || !strings.HasSuffix(ids[4], "000000000005") {
 		t.Fatalf("FIFO ids: %v", ids)
 	}
-	// D-054: ExecuteBatch is an explicit no-op — it returns the batch's current
-	// state without transitioning it or its payouts.
+	// D-063 (amends D-054): ExecuteBatch proxies saruman's SubmitBatch
+	// internal command with a BACKOFFICE actor — tolkien itself never
+	// transitions the batch or its payouts in its own database. Wire the
+	// proxy to a fake saruman command surface, assert the envelope it
+	// received, and confirm the local rows stay untouched.
+	var submittedBatchID string
+	fakeSaruman := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var env struct {
+			Command string `json:"command"`
+			Payload struct {
+				BatchID string `json:"batch_id"`
+			} `json:"payload"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&env)
+		submittedBatchID = env.Payload.BatchID
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"EXECUTING"}`))
+	}))
+	defer fakeSaruman.Close()
+	application.PayoutProxy = &app.PayoutProxy{SarumanInternalURL: fakeSaruman.URL, InternalKey: "test-saruman-key", Client: fakeSaruman.Client()}
 	execute := requestJSON(t, h, http.MethodPost, "/v1/admin/payout-batches/"+batchBody.ID+"/execute", map[string]any{}, adminHeaders)
 	if execute.Code != http.StatusOK {
 		t.Fatalf("execute: %d %s", execute.Code, execute.Body.String())
@@ -280,8 +299,11 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 		Status string `json:"status"`
 	}
 	decodeBody(t, execute, &executeBody)
-	if executeBody.Status != "DRAFT" {
-		t.Fatalf("execute no-op: status=%q, want DRAFT", executeBody.Status)
+	if executeBody.Status != "EXECUTING" {
+		t.Fatalf("execute status: %q, want EXECUTING", executeBody.Status)
+	}
+	if submittedBatchID != batchBody.ID {
+		t.Fatalf("saruman received batch_id %q, want %q", submittedBatchID, batchBody.ID)
 	}
 	var batched int
 	if err = db.QueryRow(`SELECT COUNT(*) FROM payouts WHERE batch_id=$1 AND status='BATCHED'`, batchBody.ID).Scan(&batched); err != nil || batched != 5 {
@@ -296,7 +318,7 @@ func TestHoldsAndBatchesPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	if batchedCount != 5 || executedCount != 0 {
-		t.Fatalf("outbox batch events: batched=%d executed=%d (execute is a no-op)", batchedCount, executedCount)
+		t.Fatalf("outbox batch events: batched=%d executed=%d (tolkien never emits execution events; saruman owns the transition)", batchedCount, executedCount)
 	}
 	var createdHolds, releasedHolds int
 	if err = db.QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id=$1 AND event_type=$2`, holdBody.ID, events.FundHoldCreated).Scan(&createdHolds); err != nil {

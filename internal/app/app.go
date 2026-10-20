@@ -42,6 +42,9 @@ var (
 	// ErrAdminInactive indicates a resolved backoffice identity is disabled.
 	// Distinct from ErrInactive so callers can map 403 ADMIN_INACTIVE.
 	ErrAdminInactive = errors.New("admin inactive")
+	// ErrPayoutService indicates the saruman payout command proxy is
+	// unreachable or answered with an unexpected status (D-063).
+	ErrPayoutService = errors.New("payout service unavailable")
 	// errHandleCollision rebinds signup to a fresh handle suffix.
 	errHandleCollision = errors.New("handle collision")
 )

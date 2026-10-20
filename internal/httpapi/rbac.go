@@ -29,6 +29,13 @@ const (
 	PermReceiptResend      = "Receipt:Resend"
 	PermAdminManage        = "Admin:Manage"
 	PermAuditRead          = "Audit:Read"
+	// Marvel backoffice surfaces (D-064, seeded by migration 00017 for ADMIN
+	// and SUPERADMIN): streamer list + per-streamer platform fee (D-060) and
+	// the mdr_rates admin CRUD (D-061).
+	PermStreamerRead  = "Streamer:Read"
+	PermStreamerWrite = "Streamer:Write"
+	PermMdrRateRead   = "MdrRate:Read"
+	PermMdrRateWrite  = "MdrRate:Write"
 )
 
 // Role names (app_role enum, saruman 00015).

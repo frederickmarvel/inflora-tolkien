@@ -21,20 +21,32 @@ type PayoutProxy struct {
 	Client             *http.Client
 }
 
+// CommandActor is the envelope actor for an internal payout command. Creator
+// flows send {STREAMER, streamer_id}; backoffice flows send
+// {BACKOFFICE, admin_user_id, role} so saruman's audit attribution carries
+// the operator (D-063).
+type CommandActor struct {
+	Type string
+	ID   string
+	Role string
+}
+
 // Send posts one command envelope to saruman and returns the upstream status
-// code and decoded JSON body. actorID is the session-derived streamer id
-// (the envelope actor type is always STREAMER for the /v1/me path); requestID
-// rides both the header and the envelope for audit correlation.
-func (p *PayoutProxy) Send(ctx context.Context, command string, payload map[string]any, idempotencyKey, actorID, requestID string) (int, map[string]any, error) {
+// code and decoded JSON body. requestID rides both the header and the
+// envelope for audit correlation.
+func (p *PayoutProxy) Send(ctx context.Context, command string, payload map[string]any, idempotencyKey string, actor CommandActor, requestID string) (int, map[string]any, error) {
 	if p == nil || strings.TrimSpace(p.SarumanInternalURL) == "" {
 		return 0, nil, errors.New("payout command proxy is not configured")
+	}
+	if actor.Type == "" {
+		actor.Type = "STREAMER"
 	}
 	envelope := map[string]any{
 		"command":         command,
 		"payload":         payload,
 		"idempotency_key": idempotencyKey,
 		"request_id":      requestID,
-		"actor":           map[string]string{"type": "STREAMER", "id": actorID},
+		"actor":           map[string]string{"type": actor.Type, "id": actor.ID, "role": actor.Role},
 	}
 	raw, err := json.Marshal(envelope)
 	if err != nil {

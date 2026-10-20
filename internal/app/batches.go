@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/http"
 	"time"
 
 	"github.com/frederickmarvel/inflora-shared/events"
+	"github.com/frederickmarvel/inflora-shared/keys"
 	"github.com/frederickmarvel/inflora-shared/outbox"
 	"github.com/google/uuid"
 )
@@ -144,32 +146,43 @@ func (a *App) ListBatches(ctx context.Context, status string) ([]Batch, error) {
 	return out, rows.Err()
 }
 
-// ExecuteBatch is an explicit no-op for Phase C (CONTRACT_DRIFT D-054): there
-// is no provider batch execution, so it returns the batch's current state
-// without transitioning it or its payouts. Batch lifecycle commands run
-// through saruman's internal command surface instead.
-func (a *App) ExecuteBatch(ctx context.Context, id string) (Batch, error) {
+// ExecuteBatchResult is the frozen POST /execute response (03 §6):
+// provider_batch_id/executed_at stay null — saruman's SubmitBatch does the
+// bookkeeping in its own transaction and there is no provider bulk-execution
+// (D-055/D-062).
+type ExecuteBatchResult struct {
+	BatchID         string     `json:"batch_id"`
+	Status          string     `json:"status"`
+	ProviderBatchID *string    `json:"provider_batch_id"`
+	ExecutedAt      *time.Time `json:"executed_at"`
+}
+
+// ExecuteBatch executes a DRAFT batch by proxying saruman's SubmitBatch
+// internal command (CONTRACT_DRIFT D-063, which amends D-054's no-op): every
+// member moves BATCHED->PROCESSING with attempt/lease raise and the
+// gateway-row assert inside saruman's serializable transaction. The actor is
+// the backoffice operator (BACKOFFICE); tolkien never writes money.
+func (a *App) ExecuteBatch(ctx context.Context, id string, actor CommandActor, requestID string) (ExecuteBatchResult, error) {
 	if _, err := uuid.Parse(id); err != nil {
-		return Batch{}, ErrInvalid
+		return ExecuteBatchResult{}, ErrInvalid
 	}
-	var b Batch
-	var provider sql.NullString
-	var executing sql.NullTime
-	err := a.DB.QueryRowContext(ctx, `SELECT id,status,total_amount_idr,payout_count,provider_batch_id,created_by,created_at,executing_at FROM payout_batches WHERE id=$1`, id).
-		Scan(&b.ID, &b.Status, &b.TotalAmountIDR, &b.PayoutCount, &provider, &b.CreatedBy, &b.CreatedAt, &executing)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Batch{}, ErrNotFound
+	if a.PayoutProxy == nil {
+		return ExecuteBatchResult{}, ErrPayoutService
 	}
+	status, _, err := a.PayoutProxy.Send(ctx, "SubmitBatch", map[string]any{"batch_id": id}, keys.SubmitBatchKey(id), actor, requestID)
 	if err != nil {
-		return Batch{}, err
+		return ExecuteBatchResult{}, ErrPayoutService
 	}
-	if provider.Valid {
-		b.ProviderBatchID = &provider.String
+	switch status {
+	case http.StatusOK:
+		return ExecuteBatchResult{BatchID: id, Status: "EXECUTING"}, nil
+	case http.StatusNotFound:
+		return ExecuteBatchResult{}, ErrNotFound
+	case http.StatusConflict:
+		return ExecuteBatchResult{}, ErrConflict
+	default:
+		return ExecuteBatchResult{}, ErrPayoutService
 	}
-	if executing.Valid {
-		b.ExecutingAt = &executing.Time
-	}
-	return b, nil
 }
 
 // ResendReceipt queues an existing donation receipt for delivery.

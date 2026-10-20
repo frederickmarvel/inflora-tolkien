@@ -39,7 +39,7 @@ func (s *Server) createPayout(w http.ResponseWriter, r *http.Request) {
 		"amount_idr":      q.AmountIDR,
 		"bank_account_id": q.BankAccountID,
 		"idempotency_key": idempotencyKey,
-	}, idempotencyKey, p.StreamerID, requestID)
+	}, idempotencyKey, app.CommandActor{Type: "STREAMER", ID: p.StreamerID}, requestID)
 	if err != nil {
 		app.Error(w, r, 503, "PAYOUT_SERVICE_UNAVAILABLE", "payout service unavailable")
 		return
